@@ -1,0 +1,10 @@
+git.md
+*.exe
+commands.xsh
+*.code-workspace
+ctx_cache/
+task.nims
+config.nims
+publish.md
+df/
+src_old/
