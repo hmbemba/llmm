@@ -6,3 +6,5 @@ commands.xsh
 ctx_cache/
 *.nims
 *.db
+finalOutput.md
+slash_cmds.md
