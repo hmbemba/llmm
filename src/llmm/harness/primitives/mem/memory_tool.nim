@@ -1,24 +1,26 @@
-## memory_tool.nim — LLM-facing memory tool
+## memory/tool.nim — LLM-facing memory tool
 ##
-## A single tool with a `command` field: store, recall, update, list
-## Follows the same pattern as HITLTool.
+## Thin wrapper: just the tool definition + handler that delegates to MemoryStore.
+## Import the parent memory module for all actual logic.
 
 import std/[
-json
-,asyncdispatch
-,strutils
-,sequtils
-,strformat
+    json
+    ,asyncdispatch
+    ,strutils
+    ,sequtils
+    ,strformat
 ]
 
+import ic
 import ../../tools/base
-,types
-,store
+import ./memory
 
 
 proc MemoryTool*(store: MemoryStore): Tool =
     ## Factory proc — captures the MemoryStore in the closure.
     let s = store
+
+    icb "MemoryTool factory initialized"
 
     Tool(
         name        : "memory"
@@ -78,29 +80,44 @@ Commands:
         }
 
         ,handler: proc(args: JsonNode): Future[JsonNode] {.async, gcsafe.} =
-            let command = args["command"].getStr()
+            icb "memory tool handler invoked", $args
+
+            # Guard: args might be a JSON string that needs parsing
+            var parsedArgs = args
+            if args.kind == JString:
+                try:
+                    parsedArgs = parseJson(args.getStr())
+                    icy "Args were string-wrapped JSON, re-parsed"
+                except:
+                    icr "Invalid JSON arguments", $args
+                    return toolError("Invalid JSON arguments: " & $args)
+
+            if parsedArgs.kind != JObject:
+                icr "Expected JObject, got", $parsedArgs.kind
+                return toolError("Expected JSON object for arguments, got: " & $parsedArgs.kind)
+
+            let command = parsedArgs["command"].getStr()
+            icb "memory command " & command
 
             case command
+
             # ---------------------------------------------------------
             # STORE
             # ---------------------------------------------------------
             of "store":
-                let content = args.getOrDefault("content").getStr("")
+                let content = parsedArgs.getOrDefault("content").getStr("")
                 if content.len == 0:
+                    icr "store: missing content"
                     return toolError("'content' is required for store command")
 
-                let kindStr = args.getOrDefault("kind").getStr("fact")
-                let kind = case kindStr
-                    of "fact"   : mkFact
-                    of "lesson" : mkLesson
-                    of "summary": mkSummary
-                    else        : mkFact
-
-                let tags = if args.hasKey("tags"):
-                        args["tags"].getElems().mapIt(it.getStr())
+                let kindStr = parsedArgs.getOrDefault("kind").getStr("fact")
+                let kind    = toMemoryKind(kindStr)
+                let tags    = if parsedArgs.hasKey("tags"):
+                        parsedArgs["tags"].getElems().mapIt(it.getStr())
                     else: @[]
+                let source = parsedArgs.getOrDefault("source").getStr("reflection")
 
-                let source = args.getOrDefault("source").getStr("reflection")
+                ic kindStr, content, tags, source
 
                 let entry = s.store(
                     kind    = kind
@@ -109,8 +126,9 @@ Commands:
                     ,source  = source
                 )
 
+                ic "Stored memory", entry.uid, entry.content
                 return toolSuccess(%*{
-                    "memory_id": entry.id
+                    "memory_id": entry.uid
                     ,"stored"  : entry.content
                 }, message = "Memory stored successfully")
 
@@ -118,46 +136,48 @@ Commands:
             # RECALL
             # ---------------------------------------------------------
             of "recall":
-                let query = args.getOrDefault("query").getStr("")
-                let tags  = if args.hasKey("tags"):
-                        args["tags"].getElems().mapIt(it.getStr())
+                let query = parsedArgs.getOrDefault("query").getStr("")
+                let tags  = if parsedArgs.hasKey("tags"):
+                        parsedArgs["tags"].getElems().mapIt(it.getStr())
                     else: @[]
-                let limit = args.getOrDefault("limit").getInt(5)
+                let limit = parsedArgs.getOrDefault("limit").getInt(5)
+
+                ic query, tags, limit
 
                 var filterKind = false
                 var kind = mkFact
-                if args.hasKey("kind"):
+                if parsedArgs.hasKey("kind"):
                     filterKind = true
-                    let kindStr = args["kind"].getStr("fact")
-                    kind = case kindStr
-                        of "fact"   : mkFact
-                        of "lesson" : mkLesson
-                        of "summary": mkSummary
-                        else        : mkFact
+                    kind = toMemoryKind(parsedArgs["kind"].getStr("fact"))
+                    ic "recall filtering by kind", $kind
 
                 let results = s.recall(
                     query      = query
-                    ,tags      = tags
-                    ,kind      = kind
+                    ,tags       = tags
+                    ,kind       = kind
                     ,filterKind = filterKind
-                    ,limit     = limit
+                    ,limit      = limit
                 )
 
+                ic "recall results", results.len
+
                 if results.len == 0:
+                    icy "No matching memories found", query
                     return toolSuccess(%*{"memories": newJArray(), "count": 0}
                         ,message = "No matching memories found")
 
                 var arr = newJArray()
                 for m in results:
                     arr.add(%*{
-                        "id"          : m.id
-                        ,"kind"       : $m.kind
+                        "id"          : m.uid
+                        ,"kind"       : m.kind
                         ,"content"    : m.content
                         ,"tags"       : m.tags
                         ,"helpfulness": m.helpfulness
                         ,"source"     : m.source
                     })
 
+                ic "Returning memories", results.len
                 return toolSuccess(%*{
                     "memories": arr
                     ,"count"  : results.len
@@ -167,44 +187,47 @@ Commands:
             # UPDATE
             # ---------------------------------------------------------
             of "update":
-                let memId = args.getOrDefault("memory_id").getStr("")
+                let memId = parsedArgs.getOrDefault("memory_id").getStr("")
                 if memId.len == 0:
+                    icr "update: missing memory_id"
                     return toolError("'memory_id' is required for update command")
 
-                let helpfulness = args.getOrDefault("helpfulness").getFloat(-1.0)
-                let newTags     = if args.hasKey("tags"):
-                        args["tags"].getElems().mapIt(it.getStr())
+                let helpfulness = parsedArgs.getOrDefault("helpfulness").getFloat(-1.0)
+                let newTags     = if parsedArgs.hasKey("tags"):
+                        parsedArgs["tags"].getElems().mapIt(it.getStr())
                     else: @[]
+
+                ic memId, helpfulness, newTags
 
                 let ok = s.update(memId, helpfulness, newTags)
                 if ok:
+                    ic "Memory updated", memId
                     return toolSuccess(message = "Memory updated")
                 else:
+                    icr "Memory not found", memId
                     return toolError("Memory not found with id: " & memId)
 
             # ---------------------------------------------------------
             # LIST
             # ---------------------------------------------------------
             of "list":
-                let limit = args.getOrDefault("limit").getInt(20)
+                let limit = parsedArgs.getOrDefault("limit").getInt(20)
 
                 var filterKind = false
                 var kind = mkFact
-                if args.hasKey("kind"):
+                if parsedArgs.hasKey("kind"):
                     filterKind = true
-                    let kindStr = args["kind"].getStr("fact")
-                    kind = case kindStr
-                        of "fact"   : mkFact
-                        of "lesson" : mkLesson
-                        of "summary": mkSummary
-                        else        : mkFact
+                    kind = toMemoryKind(parsedArgs["kind"].getStr("fact"))
+                    ic "list filtering by kind", $kind
+
+                ic "Listing memories", limit, filterKind
 
                 let results = s.list(kind = kind, filterKind = filterKind, limit = limit)
                 var arr = newJArray()
                 for m in results:
                     arr.add(%*{
-                        "id"          : m.id
-                        ,"kind"       : $m.kind
+                        "id"          : m.uid
+                        ,"kind"       : m.kind
                         ,"content"    : m.content
                         ,"tags"       : m.tags
                         ,"helpfulness": m.helpfulness
@@ -212,12 +235,14 @@ Commands:
                         ,"source"     : m.source
                     })
 
+                ic "Listed", results.len, "of", s.count(), "total"
                 return toolSuccess(%*{
-                    "memories"    : arr
-                    ,"count"      : results.len
+                    "memories"     : arr
+                    ,"count"       : results.len
                     ,"total_stored": s.count()
                 })
 
             else:
+                icr "Unknown memory command", command
                 return toolError("Unknown command: " & command & ". Use: store, recall, update, list")
     )

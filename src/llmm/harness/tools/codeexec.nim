@@ -455,6 +455,418 @@ proc NimTestTool*(basePath: string = ".", nimFlags: seq[string] = @[]): Tool =
     )
 
 
+
+# -----------------------------------------------------------------------------
+# Nim Source Analysis Tools
+# -----------------------------------------------------------------------------
+
+proc NimListTypesTool*(basePath: string = "."): Tool =
+    ## List type definitions in a Nim source file using native parsing.
+    let absBasePath = absolutePath(basePath).normalizedPath
+    
+    Tool(
+        name        : "nim_list_types"
+        ,description: "List all type definitions in a Nim source file. Returns type names with line numbers."
+        ,parameters : %*{
+            "type": "object"
+            ,"properties": {
+                "filename": {
+                    "type": "string"
+                    ,"description": "Nim source file to analyze (e.g., 'agent.nim')"
+                }
+            }
+            ,"required": ["filename"]
+            ,"additionalProperties": false
+        }
+        ,strict     : true
+        ,handler    : proc(args: JsonNode): Future[JsonNode] {.gcsafe, async.} =
+            let
+                filename = args["filename"].getStr
+                realPath = resolvePath(absBasePath, filename)
+            
+            if not fileExists(realPath):
+                return toolError(&"Source file not found: {filename} (resolved to: {realPath})")
+            
+            echo &"  → Listing types in: {filename}"
+            
+            var types: seq[JsonNode] = @[]
+            var lineNum = 0
+            
+            try:
+                let content = readFile(realPath)
+                var inTypeSection = false
+                var currentType = ""
+                var startLine = 0
+                var braceDepth = 0
+                
+                for line in content.splitLines():
+                    lineNum += 1
+                    let stripped = line.strip()
+                    
+                    # Check for type section start
+                    if stripped == "type":
+                        inTypeSection = true
+                        continue
+                    
+                    # Check for type section end (non-indented line that's not a comment or empty)
+                    if inTypeSection and stripped.len > 0 and not stripped.startsWith("#"):
+                        let indent = line.len - line.strip(leading=true).len
+                        if indent == 0 and not (stripped.startsWith("type ") or stripped == "type"):
+                            # This might be end of type section, but could also be a one-liner
+                            # Check if it's a type definition on one line
+                            if not (stripped.contains("=") and not stripped.startsWith("import") and 
+                                   not stripped.startsWith("export") and not stripped.startsWith("from")):
+                                inTypeSection = false
+                                continue
+                    
+                    if inTypeSection:
+                        # Check if this is a new type definition (indented, followed by = or {.})
+                        let isTypeDef = stripped.len > 0 and 
+                                       not stripped.startsWith("#") and
+                                       (stripped.contains("=") or stripped.contains("{.") or
+                                        (stripped[0] in {'A'..'Z', 'a'..'z', '_'} and 
+                                         not stripped.startsWith("proc ") and
+                                         not stripped.startsWith("func ") and
+                                         not stripped.startsWith("method ") and
+                                         not stripped.startsWith("iterator ") and
+                                         not stripped.startsWith("converter ") and
+                                         not stripped.startsWith("template ") and
+                                         not stripped.startsWith("macro ")))
+                        
+                        if isTypeDef:
+                            # If we were building a previous type, save it
+                            if currentType.len > 0:
+                                types.add(%*{
+                                    "line": startLine,
+                                    "definition": currentType.strip()
+                                })
+                            
+                            currentType = line
+                            startLine = lineNum
+                            
+                            # Check if type ends on this line (one-liner)
+                            braceDepth = 0
+                            for i, c in stripped:
+                                if c == '{': braceDepth += 1
+                                elif c == '}': braceDepth -= 1
+                            
+                            # Simple heuristic: if line ends with basic type or has no opening brace/paren
+                            if stripped.endsWith("object") or stripped.endsWith("enum") or 
+                               stripped.endsWith("tuple") or stripped.endsWith("ref object") or
+                               stripped.endsWith("ptr object") or stripped.endsWith("distinct") or
+                               (not stripped.contains("{") and not stripped.contains("(")) or
+                               (braceDepth == 0 and (stripped.endsWith("}") or stripped.endsWith(")"))):
+                                types.add(%*{
+                                    "line": startLine,
+                                    "definition": currentType.strip()
+                                })
+                                currentType = ""
+                        
+                        elif currentType.len > 0:
+                            # Continuation of multi-line type
+                            currentType.add("\n" & line)
+                            
+                            # Track brace depth to detect end
+                            for c in stripped:
+                                if c == '{': braceDepth += 1
+                                elif c == '}': braceDepth -= 1
+                            
+                            # Check for end of type definition
+                            if stripped == "" or (braceDepth <= 0 and stripped.endsWith("}")) or
+                               (not stripped.startsWith(" ") and not stripped.startsWith("\t") and not stripped.startsWith("#")):
+                                types.add(%*{
+                                    "line": startLine,
+                                    "definition": currentType.strip()
+                                })
+                                currentType = ""
+                                braceDepth = 0
+                
+                # Don't forget the last type
+                if currentType.len > 0:
+                    types.add(%*{
+                        "line": startLine,
+                        "definition": currentType.strip()
+                    })
+                
+                echo &"  ✓ Found {types.len} type definitions"
+                
+                return toolSuccess(%*{
+                    "filename": filename,
+                    "path": realPath,
+                    "types": types,
+                    "count": types.len
+                })
+                
+            except IOError as e:
+                return toolError(&"Failed to read file: {e.msg}")
+    )
+
+
+proc NimListImportsTool*(basePath: string = "."): Tool =
+    ## List imports and exports in a Nim source file using native parsing.
+    let absBasePath = absolutePath(basePath).normalizedPath
+    
+    Tool(
+        name        : "nim_list_imports"
+        ,description: "List all import, export, and from/import statements in a Nim source file with line numbers."
+        ,parameters : %*{
+            "type": "object"
+            ,"properties": {
+                "filename": {
+                    "type": "string"
+                    ,"description": "Nim source file to analyze (e.g., 'types.nim')"
+                }
+            }
+            ,"required": ["filename"]
+            ,"additionalProperties": false
+        }
+        ,strict     : true
+        ,handler    : proc(args: JsonNode): Future[JsonNode] {.gcsafe, async.} =
+            let
+                filename = args["filename"].getStr
+                realPath = resolvePath(absBasePath, filename)
+            
+            if not fileExists(realPath):
+                return toolError(&"Source file not found: {filename} (resolved to: {realPath})")
+            
+            echo &"  → Listing imports/exports in: {filename}"
+            
+            var imports: seq[JsonNode] = @[]
+            var exports: seq[JsonNode] = @[]
+            var fromImports: seq[JsonNode] = @[]
+            var lineNum = 0
+            
+            try:
+                let content = readFile(realPath)
+                var inImportBlock = false
+                var inExportBlock = false
+                var blockStartLine = 0
+                var blockKind = ""  # "import" or "export"
+                
+                for line in content.splitLines():
+                    lineNum += 1
+                    let stripped = line.strip()
+                    
+                    # Skip empty lines and comments (unless in block)
+                    if stripped.len == 0 or stripped.startsWith("#"):
+                        if not inImportBlock and not inExportBlock:
+                            continue
+                    
+                    # Check for block start (import or export on their own line)
+                    if stripped == "import":
+                        inImportBlock = true
+                        blockStartLine = lineNum
+                        blockKind = "import"
+                        continue
+                    elif stripped == "export":
+                        inExportBlock = true
+                        blockStartLine = lineNum
+                        blockKind = "export"
+                        continue
+                    
+                    # Handle from/module import syntax
+                    if stripped.startsWith("from "):
+                        let parts = stripped.split(" import ")
+                        if parts.len >= 2:
+                            fromImports.add(%*{
+                                "line": lineNum,
+                                "module": parts[0][5..^1].strip(),  # Remove "from "
+                                "symbols": parts[1..^1].join(" import ").split(",").mapIt(it.strip())
+                            })
+                        else:
+                            fromImports.add(%*{
+                                "line": lineNum,
+                                "statement": stripped
+                            })
+                        continue
+                    
+                    # Handle single-line import/export statements
+                    if stripped.startsWith("import "):
+                        let rest = stripped[7..^1]  # Remove "import "
+                        # Handle comma-separated imports
+                        let modules = rest.split(",").mapIt(it.strip())
+                        for modd in modules:
+                            if modd.len > 0:
+                                imports.add(%*{
+                                    "line": lineNum,
+                                    "module": modd,
+                                    "statement": stripped
+                                })
+                        continue
+                    
+                    if stripped.startsWith("export "):
+                        let rest = stripped[7..^1]  # Remove "export "
+                        let modules = rest.split(",").mapIt(it.strip())
+                        for modd in modules:
+                            if modd.len > 0:
+                                exports.add(%*{
+                                    "line": lineNum,
+                                    "module": modd,
+                                    "statement": stripped
+                                })
+                        continue
+                    
+                    # Handle multi-line import/export blocks
+                    if inImportBlock:
+                        # Check if line is indented (continuation) or empty/comment
+                        let indent = line.len - line.strip(leading=true).len
+                        if indent > 0 or stripped.len == 0 or stripped.startsWith("#"):
+                            if stripped.len > 0 and not stripped.startsWith("#"):
+                                # It's a module in the block
+                                let modules = stripped.split(",").mapIt(it.strip())
+                                for modd in modules:
+                                    if modd.len > 0:
+                                        imports.add(%*{
+                                            "line": lineNum,
+                                            "module": modd,
+                                            "statement": "import " & modd,
+                                            "block_start": blockStartLine
+                                        })
+                        else:
+                            # Non-indented, non-empty line ends the block
+                            inImportBlock = false
+                            # Re-process this line as it might be something else
+                            lineNum -= 1  # Hack: reprocess this line
+                            continue
+                    
+                    if inExportBlock:
+                        let indent = line.len - line.strip(leading=true).len
+                        if indent > 0 or stripped.len == 0 or stripped.startsWith("#"):
+                            if stripped.len > 0 and not stripped.startsWith("#"):
+                                let modules = stripped.split(",").mapIt(it.strip())
+                                for modd in modules:
+                                    if modd.len > 0:
+                                        exports.add(%*{
+                                            "line": lineNum,
+                                            "module": modd,
+                                            "statement": "export " & modd,
+                                            "block_start": blockStartLine
+                                        })
+                        else:
+                            inExportBlock = false
+                            lineNum -= 1
+                            continue
+                
+                echo &"  ✓ Found {imports.len} imports, {exports.len} exports, {fromImports.len} from-imports"
+                
+                return toolSuccess(%*{
+                    "filename": filename,
+                    "path": realPath,
+                    "imports": imports,
+                    "exports": exports,
+                    "from_imports": fromImports,
+                    "total": imports.len + exports.len + fromImports.len
+                })
+                
+            except IOError as e:
+                return toolError(&"Failed to read file: {e.msg}")
+    )
+proc NimListProcsTool*(basePath: string = "."): Tool =
+    ## List proc signatures in a Nim source file using native parsing.
+    let absBasePath = absolutePath(basePath).normalizedPath
+    
+    Tool(
+        name        : "nim_list_procs"
+        ,description: "List all proc/func/method signatures in a Nim source file. Returns proc names with line numbers."
+        ,parameters : %*{
+            "type": "object"
+            ,"properties": {
+                "filename": {
+                    "type": "string"
+                    ,"description": "Nim source file to analyze (e.g., 'agent.nim')"
+                }
+            }
+            ,"required": ["filename"]
+            ,"additionalProperties": false
+        }
+        ,strict     : true
+        ,handler    : proc(args: JsonNode): Future[JsonNode] {.gcsafe, async.} =
+            let
+                filename = args["filename"].getStr
+                realPath = resolvePath(absBasePath, filename)
+            
+            if not fileExists(realPath):
+                return toolError(&"Source file not found: {filename} (resolved to: {realPath})")
+            
+            echo &"  → Listing procs in: {filename}"
+            
+            # Native Nim parsing - no shell escaping issues
+            var procs: seq[JsonNode] = @[]
+            var lineNum = 0
+            
+            try:
+                let content = readFile(realPath)
+                var inMultiLine = false
+                var currentProc = ""
+                var startLine = 0
+                
+                # Keywords that start a callable definition
+                const callableKeywords = ["proc", "func", "method", "iterator", "converter", "template", "macro"]
+                
+                for line in content.splitLines():
+                    lineNum += 1
+                    let stripped = line.strip()
+                    
+                    # Check if line starts with a callable keyword
+                    var isCallableStart = false
+                    var keywordLen = 0
+                    
+                    for kw in callableKeywords:
+                        if stripped.startsWith(kw & " "):
+                            isCallableStart = true
+                            keywordLen = kw.len
+                            break
+                    
+                    if isCallableStart and not inMultiLine:
+                        # Start of a new callable
+                        inMultiLine = true
+                        currentProc = line
+                        startLine = lineNum
+                        
+                        # Check if it ends on this line
+                        if stripped.endsWith("=") or " = " in stripped:
+                            inMultiLine = false
+                            procs.add(%*{
+                                "line": startLine,
+                                "signature": currentProc.strip()
+                            })
+                            currentProc = ""
+                    
+                    elif inMultiLine:
+                        currentProc.add("\n" & line)
+                        # Check for end of signature
+                        if stripped.endsWith("=") or stripped == "" or 
+                           (stripped.len > 0 and stripped[0] notin {' ', '\t'}):
+                            inMultiLine = false
+                            procs.add(%*{
+                                "line": startLine,
+                                "signature": currentProc.strip()
+                            })
+                            currentProc = ""
+                
+                # Handle case where file ends while still in a proc
+                if inMultiLine and currentProc.len > 0:
+                    procs.add(%*{
+                        "line": startLine,
+                        "signature": currentProc.strip()
+                    })
+                
+                echo &"  ✓ Found {procs.len} procedures"
+                
+                return toolSuccess(%*{
+                    "filename": filename,
+                    "path": realPath,
+                    "procedures": procs,
+                    "count": procs.len
+                })
+                
+            except IOError as e:
+                return toolError(&"Failed to read file: {e.msg}")
+    )
+
+
+
+
 # -----------------------------------------------------------------------------
 # Shell/Process Tools
 # -----------------------------------------------------------------------------
@@ -573,13 +985,15 @@ proc ReadErrorsTool*(basePath: string = "."): Tool =
 # -----------------------------------------------------------------------------
 
 proc NimDevToolkit*(basePath: string = ".", nimFlags: seq[string] = @[]): Toolkit =
-    ## Full Nim development toolkit.
     result = newToolkit("nim_dev", "Nim compilation, execution, and debugging tools")
     result.add NimCompileTool(basePath, nimFlags)
     result.add NimRunTool(basePath, nimFlags)
     result.add NimCheckTool(basePath)
     result.add NimTestTool(basePath, nimFlags)
     result.add ReadErrorsTool(basePath)
+    result.add NimListTypesTool(basePath)
+    result.add NimListProcsTool(basePath)
+    result.add NimListImportsTool(basePath)
 
 
 proc NimRunOnlyToolkit*(basePath: string = ".", nimFlags: seq[string] = @[]): Toolkit =

@@ -11,14 +11,16 @@ json
 ,strutils
 ,sugar
 ,tables
+,sequtils
+,os
 ]
-import std/[selectors, os, times]
 
 import rz
 ,ic
-,os
-import agent
+,agent
 ,sessions
+,store
+,multimodal
 ,../tools/base
 ,../../general_helpers
 ,../../providers/oai/oai_client
@@ -28,13 +30,13 @@ import agent
 ,../../providers/oai/responses/api
 ,../../providers/oai/responses/utils
 
-,./memory/types
-,./memory/store
-,./memory/tool        
-,./memory/integration
+import ./mem/[
+memory
+,memory_tool
+]    
 
 
-type 
+type
     TickResult      * = object
         events      * : seq[AgentEvent]
         text        * : string
@@ -46,79 +48,470 @@ type
         error       * : Option[string]
 
 
-proc appendToJsonFile*(filepath : string, content : JsonNode)  = 
-    if not filepath.fileExists:
-        writeFile(filepath, pretty content)
-        return 
-
-    let file_as_json = parseJson(readFile(filepath))
-    if file_as_json.kind != JArray:
-        raise newException(ValueError, fmt"File {filepath} is not a JSON array")
-    file_as_json.add content
-    writeFile(filepath, pretty file_as_json)
-
-
 # ---------------------------------------------------------------------------
 # Reflection mini-loop
 # ---------------------------------------------------------------------------
 
 proc runReflection(a: Agent, lastResponseId: string) {.async.} =
-    ## Fire a reflection turn after task completion.
-    ## The LLM gets the reflection prompt + only the memory tool.
-    ## Any memory tool calls are executed, then we're done.
-    ## This is "invisible" — nothing goes into session history.
-    
-    let 
-        memTool     = MemoryTool(a.memoryStore)
-        reflectMsgs = buildReflectionMessages()
-    
-    var reflectOpts = CreateResponseOptions(
-        model               : a.model
-        ,tools              : some @[%memTool]
-        ,previousResponseId : some lastResponseId
-        ,input              : some %reflectMsgs
-    )
-    
-    var resp = await a.client.createResponse(reflectOpts)
-    if not resp.ok:
-        # Reflection failure is non-fatal — just log and move on
-        
-        icr "Reflection API error", resp.err
-        return
-    
-    # Mini tool loop: handle memory tool calls from reflection
-    var loopCount = 0
-    const maxReflectionLoops = 3  # Safety cap
-    
-    while resp.hasFunctionCalls and loopCount < maxReflectionLoops:
-        loopCount.inc
-        var toolResults: seq[JsonNode] = @[]
-        
-        for fc in resp.functionCalls:
-            # Only execute memory tool calls — ignore anything else
-            if fc.name == memTool.name:
-                let payload = await memTool.handler(fc.arguments)
-                toolResults.add(functionOutput(fc.callId, payload))
-            else:
-                toolResults.add(functionOutput(fc.callId, 
-                    toolError("Only memory tool is available during reflection")))
-        
-        # Chain and continue
-        reflectOpts.previousResponseId = some resp.id
-        reflectOpts.input              = some %toolResults
-        resp = await a.client.createResponse(reflectOpts)
-        
+    try:
+        icb "Starting reflection loop", lastResponseId
+
+        # Guard: memory store must exist
+        if a.state.memoryStore.isNil:
+            icr "Reflection skipped: memoryStore is nil"
+            return
+
+        let
+            memTool     = MemoryTool(a.state.memoryStore)
+            reflectMsgs = buildReflectionMessages()
+
+        var opts = CreateResponseOptions(
+            model               : a.cfg.model
+            ,tools              : some @[%memTool]
+            ,previousResponseId : some lastResponseId
+            ,input              : some %reflectMsgs
+        )
+
+        var resp = await a.client.createResponse(opts)
         if not resp.ok:
-            
-            icr "Reflection loop error", resp.err
+            icr "Reflection API error", resp.err
+            return
+
+        const maxLoops = 3
+
+        for i in 0..<maxLoops:
+            if not resp.hasFunctionCalls:
+                icb "Reflection done (no more function calls)", i
+                break
+
+            var toolResults: seq[JsonNode] = @[]
+
+            for fc in resp.functionCalls:
+                if fc.name == memTool.name:
+                    icb "Reflection calling memory tool", fc.name, fc.arguments
+                    try:
+                        let payload = await memTool.handler(fc.arguments)
+                        ic payload
+                        toolResults.add(functionOutput(fc.callId, payload))
+                    except CatchableError as ex:
+                        icr "Memory tool handler error", ex.msg
+                        toolResults.add(functionOutput(fc.callId, toolError(ex.msg)))
+                else:
+                    icy "Reflection rejected non-memory tool", fc.name
+                    toolResults.add(functionOutput(
+                        fc.callId
+                        ,toolError("Only memory tool is available during reflection")
+                    ))
+
+            opts.previousResponseId = some resp.id
+            opts.input              = some %toolResults
+
+            resp = await a.client.createResponse(opts)
+            if not resp.ok:
+                icr "Reflection loop error", resp.err
+                break
+
+        icb "Reflection complete"
+
+    except CatchableError as ex:
+        icr "Reflection failed (non-fatal)", ex.msg
+    except Exception as ex:
+        icr "Reflection fatal error (swallowed)", ex.msg
+
+# ---------------------------------------------------------------------------
+# Main chat turn (multimodal)
+# ---------------------------------------------------------------------------
+
+proc chatTurn*(
+    a             : Agent
+    ,input        : UserInput
+    ,useChaining  = false
+    ,maxToolCalls = 0
+): Future[TickResult] {.async.} =
+
+    # Extract plain text for logging, memory injection, and db storage
+    let userText = input.plainText()
+
+    icb "=== chatTurn START ===", a.cfg.model, useChaining, maxToolCalls
+    ic userText
+    if input.hasImages: ic "Input contains images"
+    if input.hasFiles:  ic "Input contains files"
+
+    # Ensure workspace dir exists (tools may write files there)
+    # Does nothing if the directory already exists
+    createDir a.cfg.workspaceDir
+
+    # Grab the unified store handle
+    let db = a.state.agentStore
+
+    # Tools payload for the API
+    let tools_sent_to_llm: seq[JsonNode] = collect:
+        for toolName in a.cfg.tools.keys:
+            if a.cfg.enableReflection == false and toolName == "memory":
+                icy "Memory tool disabled for this turn due to reflection being disabled"
+                continue
+            let t = a.cfg.tools[toolName]
+            if t.isBuiltIn: t.parameters else: %t
+
+    icb "Tools registered " & $tools_sent_to_llm.len
+
+    let maxTC = max(maxToolCalls, a.cfg.policy.maxToolCalls)
+
+    ic maxTC
+
+    var
+        res             : TickResult
+        startTime       = now()
+        numToolCalls    = 0
+        totalTokensUsed : tuple[input: int, output: int, combined: int]
+
+    # ----- Local helpers (keep the main loop readable) -----
+
+    proc elapsedNow(): Duration = now() - startTime
+
+    proc persistArtifacts(events: seq[AgentEvent], reqOpts: seq[JsonNode], responses: seq[JsonNode]) =
+        ## Persist events, requests, and responses to the unified db.
+        ic "Persisting artifacts to db", events.len
+        for ev in events:
+            db.insertEvent($ev.kind, %ev)
+        for req in reqOpts:
+            db.insertRequest(req)
+        for resp in responses:
+            db.insertResponse(resp)
+
+    proc emitEvent(ev: AgentEvent) =
+        a.state.events.emit(ev)
+        res.events.add(ev)
+
+    # Track serialized requests/responses for bulk persist at the end
+    var
+        allReqOptsJson  : seq[JsonNode]
+        allResponsesJson: seq[JsonNode]
+
+    template finishWithError(
+        kind         : FailureKind
+        ,msg         : string
+        ,tokensNow   = 0
+        ,recoverable = false
+    ) =
+        icr "FINISH WITH ERROR", kind, msg, recoverable
+        let ev = a.ErrorEvent(
+            errorKind         = kind
+            ,errorMessage     = msg
+            ,elapsed          = elapsedNow()
+            ,tokensUsed       = tokensNow
+            ,cumulativeTokens = totalTokensUsed.combined
+            ,errorRecoverable = recoverable
+        )
+        emitEvent(ev)
+        res.error   = some(msg)
+        res.elapsed = elapsedNow()
+        res.done    = false
+        persistArtifacts(res.events, allReqOptsJson, allResponsesJson)
+
+        # Write error entry to chat history db
+        db.insertChatEntry(
+            role       = "error"
+            ,content   = msg
+            ,tokensUsed = totalTokensUsed.combined
+            ,elapsed   = elapsedNow()
+            ,model     = a.cfg.model
+            ,done      = false
+        )
+
+        return res
+
+    template enforceTimeout(tokensNow: int = 0) =
+        if a.cfg.policy.timeout > initDuration(seconds = 0):
+            let e = elapsedNow()
+            if e > a.cfg.policy.timeout:
+                let msg = "Agent timed out after " & $a.cfg.policy.timeout & ". Elapsed: " & $e & "."
+                icy "TIMEOUT", msg
+                finishWithError(
+                    fkTimeout
+                    ,msg
+                    ,tokensNow
+                    ,recoverable = true
+                )
+
+    proc usageOrWarn(resp: rz.Rz[OpenAIResponse]): Usage =
+        ## Always return *some* usage (default = zeros).
+        if resp.ok and resp.val.usage.isSome:
+            let u = resp.val.usage.get
+            ic u.inputTokens, u.outputTokens, u.totalTokens
+            return u
+
+        icy "API response missing usage information"
+        let ev = a.ErrorEvent(
+            errorKind         = fkApiError
+            ,errorMessage     = "API response missing usage information"
+            ,elapsed          = elapsedNow()
+            ,tokensUsed       = 0
+            ,cumulativeTokens = totalTokensUsed.combined
+            ,errorRecoverable = true
+        )
+        emitEvent(ev)
+        result = default(Usage)
+
+    proc buildInitialInput(userMsg: JsonNode, augmentedSystemPrompt: string): JsonNode =
+        if useChaining and a.state.session.lastResponseId.isSome:
+            icb "Chaining mode: sending only new user msg"
+            return %*[userMsg]
+
+        icb "Full context mode: system + history + user msg"
+        result = newJArray()
+        if augmentedSystemPrompt.len > 0:
+            result.add builders.systemMessage(augmentedSystemPrompt)
+
+        ic a.state.session.messages.len
+        for m in a.state.session.messages:
+            result.add m
+
+        result.add userMsg
+        return result
+
+    # ----- Build augmented system prompt (memory injection) -----
+    icy a.cfg.enableReflection
+    let augmentedSystemPrompt = if a.cfg.enableReflection:
+        injectMemoryContext(
+            store         = a.state.memoryStore
+            ,systemPrompt = a.cfg.systemPrompt
+            ,userMessage  = userText
+            ,maxMemories  = 5
+        )
+    else:
+        a.cfg.systemPrompt
+
+    icb augmentedSystemPrompt.max_len(200)
+
+    # ----- Write user entry to chat history db -----
+
+    db.insertChatEntry(
+        role     = "user"
+        ,content = userText
+        ,model   = a.cfg.model
+    )
+
+    # ----- Build first request -----
+    # Use multimodal-aware message builder
+    let userMsg = input.toUserMessage()
+
+    var reqOpts = CreateResponseOptions(
+        model         : a.cfg.model
+        ,tools        : (if tools_sent_to_llm.len > 0  : some tools_sent_to_llm  else : none seq[JsonNode])
+        ,instructions : (if a.cfg.instructions.len > 0 : some a.cfg.instructions else : none string)
+    )
+
+    if useChaining and a.state.session.lastResponseId.isSome:
+        reqOpts.previousResponseId = a.state.session.lastResponseId
+        icb "Chaining with previous response", a.state.session.lastResponseId.get
+
+    reqOpts.input = some buildInitialInput(userMsg, augmentedSystemPrompt)
+
+    allReqOptsJson.add %reqOpts
+    a.state.session.messages.add userMsg
+
+    icb "Sending initial API request"
+    var resp = await a.client.createResponse(reqOpts)
+    enforceTimeout()
+
+    allResponsesJson.add %resp
+
+    if not resp.ok:
+        icr "Initial API call failed", resp.err
+        discard a.state.session.messages.pop()
+        finishWithError(fkApiError, resp.err)
+
+    ic "Initial response OK", resp.val.id
+
+    # -----------------------------------------------------------------------
+    # TOOL LOOP
+    # -----------------------------------------------------------------------
+
+    icb "=== Entering tool loop ==="
+
+    while true:
+        enforceTimeout()
+
+        let usage = usageOrWarn(resp)
+
+        totalTokensUsed.input    += usage.inputTokens
+        totalTokensUsed.output   += usage.outputTokens
+        totalTokensUsed.combined += usage.totalTokens
+
+        ic totalTokensUsed
+
+        if not resp.hasFunctionCalls:
+            icb "No function calls — exiting tool loop"
             break
-    
-    # Done — reflection results are silently stored in memory.json
-    # Nothing is added to session history or returned to the user.
+
+        if numToolCalls >= maxTC:
+            icy "Max tool calls exceeded", numToolCalls, maxTC
+            finishWithError(
+                fkmaxToolCalls
+                ,fmt"Exceeded maximum tool calls of {maxTC}"
+                ,tokensNow = usage.totalTokens
+            )
+
+        var toolResults: seq[JsonNode] = @[]
+
+        for fc in resp.functionCalls:
+            # Unknown tool => recoverable: log + return toolError payload to model
+            if not a.cfg.tools.hasKey(fc.name):
+                let 
+                    toolNames = tools_sent_to_llm.mapIt(it["name"].getStr).join(", ")
+                    msg       = fmt"Agent attempted to call unknown tool: {fc.name}"
+
+                icr "Unknown tool call", fc.name, toolNames
+
+                let ev = a.ErrorEvent(
+                    errorKind         = fkUnknownTool
+                    ,errorMessage     = msg
+                    ,elapsed          = elapsedNow()
+                    ,tokensUsed       = usage.totalTokens
+                    ,cumulativeTokens = totalTokensUsed.combined
+                    ,errorRecoverable = true
+                )
+                emitEvent(ev)
+
+                let payload = functionOutput(
+                    fc.callId
+                    ,toolError("Unknown tool: " & fc.name & ". Available: " & toolNames)
+                )
+                toolResults.add(payload)
+                res.toolResults.add(payload)
+                continue
+
+            # Known tool call
+            numToolCalls.inc
+
+            icb "Tool call", numToolCalls, fc.name, fc.arguments
+
+            let callEvent = a.ToolCallEvent(
+                tokensUsed        = usage.totalTokens
+                ,cumulativeTokens = totalTokensUsed.combined
+                ,elapsed          = elapsedNow()
+                ,callToolName     = fc.name
+                ,callToolArgs     = fc.arguments
+                ,callToolId       = fc.id
+            )
+            emitEvent(callEvent)
+            res.toolCalls.add(fc)
+
+            enforceTimeout(usage.totalTokens)
+
+            let toolPayload = await a.cfg.tools[fc.name].handler(fc.arguments)
+
+            let callOk = base.tool_call_was_successful(toolPayload)
+            if callOk:
+                ic "Tool result OK", fc.name, toolPayload
+            else:
+                icr "Tool result FAILED", fc.name, toolPayload
+
+            let resultEvent       = a.ToolResultEvent(
+                tokensUsed        = usage.totalTokens
+                ,cumulativeTokens = totalTokensUsed.combined
+                ,elapsed          = elapsedNow()
+                ,resultToolId     = fc.callId
+                ,resultOutput     = toolPayload
+                ,resultOk         = callOk
+            )
+            emitEvent(resultEvent)
+
+            let backToModel = functionOutput(fc.callId, toolPayload)
+            toolResults.add(backToModel)
+            res.toolResults.add(backToModel)
+
+            # Failure / recovery tracking
+            if not callOk:
+                a.state.failureTracker.recordFailure(fc.name, base.get_tool_call_error(toolPayload))
+                icy "Failure recorded", fc.name
+            elif a.state.failureTracker.checkRecovery(fc.name):
+                ic "Recovery detected for tool", fc.name
+                toolResults.add(buildToolRecoveryNudge(fc.name))
+                a.state.failureTracker.clearRecovery(fc.name)
+
+        # Continue the response chain with tool outputs
+        reqOpts.previousResponseId = some resp.val.id
+        reqOpts.input              = some %toolResults
+
+        icb "Continuing response chain", toolResults.len, "tool results"
+
+        resp = await a.client.createResponse(reqOpts)
+        enforceTimeout()
+
+        allReqOptsJson.add(%reqOpts)
+        allResponsesJson.add(%resp)
+
+        if not resp.ok:
+            icr "Tool loop API error", resp.err
+            finishWithError(fkApiError, resp.err)
+
+    # -----------------------------------------------------------------------
+    # FINAL ASSISTANT MESSAGE
+    # -----------------------------------------------------------------------
+
+    icb "=== Finalizing response ==="
+
+    let text = resp.val.extractText()
+
+    ic text.len
+
+    let msgEvent = a.MessageEvent(
+        tokensUsed        = resp.val.usage.get.totalTokens
+        ,cumulativeTokens = totalTokensUsed.combined
+        ,elapsed          = elapsedNow()
+        ,msgText          = text
+    )
+
+    a.state.totalTokensUsed = totalTokensUsed
+    emitEvent(msgEvent)
+
+    res.text       = text
+    res.tokensUsed = totalTokensUsed.combined
+    res.elapsed    = elapsedNow()
+    res.done       = true
+
+    ic res.tokensUsed, res.elapsed, res.done
+
+    # Persist session state
+    a.state.session.lastResponseId = some(resp.val.id)
+    if text.len > 0:
+        a.state.session.messages.add builders.assistantMessage(text)
+
+    # Persist all artifacts to the unified db
+    persistArtifacts(res.events, allReqOptsJson, allResponsesJson)
+
+    # Write finalOutput.md to workspace dir
+    writeFile(a.cfg.workspaceDir / "finalOutput.md", text)
+
+    # Write assistant entry to chat history db (full turn record)
+    db.insertChatEntry(
+        role         = "assistant"
+        ,content     = text
+        ,toolCalls   = res.toolCalls.mapIt(%it)
+        ,toolResults = res.toolResults
+        ,tokensUsed  = totalTokensUsed.combined
+        ,elapsed     = elapsedNow()
+        ,model       = a.cfg.model
+        ,responseId  = resp.val.id
+        ,done        = true
+    )
+
+    # Post-turn reflection (never fails the turn)
+    if a.cfg.enableReflection:
+        icb "Starting post-turn reflection"
+        try:
+            await runReflection(a, resp.val.id)
+        except CatchableError as ex:
+            icr "Post-turn reflection failed (non-fatal)", ex.msg
+
+    icb "=== chatTurn DONE ===", res.tokensUsed, res.elapsed
+    return res
 
 
 # ---------------------------------------------------------------------------
-# Main chat turn
+# Backward-compatible string overload
 # ---------------------------------------------------------------------------
 
 proc chatTurn*(
@@ -127,242 +520,41 @@ proc chatTurn*(
     ,useChaining  = false
     ,maxToolCalls = 0
 ): Future[TickResult] {.async.} =
-
-
-
-    # Augment system prompt with relevant memories + memory instructions
-    let augmentedSystemPrompt = injectMemoryContext(
-        store                 = a.memoryStore
-        ,userMessage          = userText
-        ,systemPrompt         = a.systemPrompt
-        ,maxMemories          = 5
+    ## Convenience overload: wraps a plain string into UserInput.
+    return await a.chatTurn(
+        input         = multimodal.textInput(userText)
+        ,useChaining  = useChaining
+        ,maxToolCalls = maxToolCalls
     )
 
-    icb augmentedSystemPrompt
-
-    blok "Ensure agent dirs exist":
-        discard dirExistsOrMk a.workspaceDir
-        discard dirExistsOrMk a.artifactsDir
-
-    a.numSpawns.inc
-
-    let
-        maxTC = max(maxToolCalls, a.policy.maxToolCalls)
-        tools : seq[JsonNode] = collect:
-            for toolName in a.tools.registry:
-                let t = a.tools.tools[toolName]
-                if t.isBuiltIn: t.parameters else: %t
-
-    var
-        this_tick_result : TickResult
-        totalTokensUsed  : tuple[input: int, output: int, combined: int]
-        startTime        = now()
-        numToolCalls     = 0
-        allResponses     : seq[rz.Rz[OpenAIResponse]]
-        allReqOpts       : seq[CreateResponseOptions]
-
-    let userMsg = builders.userMessage(userText)
-
-    var req_opts = CreateResponseOptions(
-        model           : a.model
-        ,tools          : (if tools.len > 0: some tools else: none seq[JsonNode])
-        ,instructions   : (if a.instructions.len > 0: some a.instructions else: none string)
-    )
-
-    if useChaining and a.session.lastResponseId.isSome:
-        req_opts.previousResponseId = a.session.lastResponseId
-        req_opts.input              = some %*[userMsg]
-    else:
-        var req_input = newJArray()
-        if augmentedSystemPrompt.len > 0:
-            req_input.add builders.systemMessage(augmentedSystemPrompt)
-
-        for m in a.session.messages:
-            req_input.add m
-
-        req_input.add userMsg
-        req_opts.input = some(req_input)
-
-    allReqOpts.add req_opts
-    a.session.messages.add userMsg
-
-    var resp = await a.client.createResponse(req_opts)
-    allResponses.add resp
-
-    if not resp.ok:
-        discard a.session.messages.pop()
-        let apiErrEvent   = a.ErrorEvent(
-            errorKind     = fkApiError
-            ,errorMessage = resp.err
-            ,elapsed      = now() - startTime
-        )
-        a.emitEvent(apiErrEvent)
-        this_tick_result.events.add(apiErrEvent)
-
-        this_tick_result.error   = some(resp.err)
-        this_tick_result.elapsed = now() - startTime
-        this_tick_result.done    = false
-
-        appendToJsonFile(a.artifactsDir / "events.json"         ,   %this_tick_result.events )
-        appendToJsonFile(a.artifactsDir / "all_responses.json"  ,   %allResponses            )
-        appendToJsonFile(a.artifactsDir / "all_requests.json"   ,   %allReqOpts              )
-        return this_tick_result
-
-    # ===== TOOL LOOP =====
-    while true:
-        totalTokensUsed.input    += resp.val.usage.get.inputTokens
-        totalTokensUsed.output   += resp.val.usage.get.outputTokens
-        totalTokensUsed.combined += resp.val.usage.get.totalTokens
-
-        if not resp.hasFunctionCalls: break
-
-        if numToolCalls >= maxTC:
-            let
-                elapsed       = now() - startTime
-                errMsg        = fmt"Exceeded maximum tool calls of {maxTC}"
-                maxTCErrEvent = a.ErrorEvent(
-                    errorKind         = fkmaxToolCalls
-                    ,errorMessage     = errMsg
-                    ,elapsed          = elapsed
-                    ,tokensUsed       = resp.val.usage.get.totalTokens
-                    ,cumulativeTokens = totalTokensUsed.combined
-                )
-            a.emitEvent(maxTCErrEvent)
-            this_tick_result.events.add(maxTCErrEvent)
-
-            this_tick_result.error   = some(errMsg)
-            this_tick_result.elapsed = elapsed
-            this_tick_result.done    = false
-
-            appendToJsonFile(a.artifactsDir / "events.json"         ,   %this_tick_result.events )
-            appendToJsonFile(a.artifactsDir / "all_responses.json"  ,   %allResponses            )
-            appendToJsonFile(a.artifactsDir / "all_requests.json"   ,   %allReqOpts              )
-            return this_tick_result
-
-        var toolResults: seq[JsonNode] = @[]
-
-        for fc in resp.functionCalls:
-            numToolCalls.inc
-
-            let callEvent         = a.ToolCallEvent(
-                tokensUsed        = resp.val.usage.get.totalTokens
-                ,cumulativeTokens = totalTokensUsed.combined
-                ,elapsed          = now() - startTime
-                ,callToolName     = fc.name
-                ,callToolArgs     = fc.arguments
-                ,callToolId       = fc.id
-            )
-            a.emitEvent(callEvent)
-            this_tick_result.events.add(callEvent)
-            this_tick_result.toolCalls.add(fc)
-
-            let
-                fc_payload            = await a.tools.tools[fc.name].handler(fc.arguments)
-                fc_data_back_to_agent = functionOutput(fc.callId, fc_payload)
-                toolResultEvent       = a.ToolResultEvent(
-                    tokensUsed        = resp.val.usage.get.totalTokens
-                    ,cumulativeTokens = totalTokensUsed.combined
-                    ,elapsed          = now() - startTime
-                    ,resultToolId     = fc.callId
-                    ,resultOutput     = fc_payload
-                    ,resultOk         = base.tool_call_was_successful(fc_payload)
-                )
-
-            a.emitEvent(toolResultEvent)
-            this_tick_result.events.add(toolResultEvent)
-
-            toolResults.add(fc_data_back_to_agent)
-            this_tick_result.toolResults.add(fc_data_back_to_agent)
-
-            # ===== B: FAILURE / RECOVERY TRACKING =====
-            if not base.tool_call_was_successful(fc_payload):
-                a.failureTracker.recordFailure(fc.name, base.get_tool_call_error(fc_payload))
-            elif a.failureTracker.checkRecovery(fc.name):
-                toolResults.add(buildToolRecoveryNudge(fc.name))
-                a.failureTracker.clearRecovery(fc.name)
-
-        req_opts.previousResponseId = some resp.id
-        req_opts.input              = some %toolResults
-        resp                        = await a.client.createResponse(req_opts)
-        allReqOpts.add   req_opts
-        allResponses.add resp
-
-        if not resp.ok:
-            let apiErrEvent = a.ErrorEvent(
-                errorKind     = fkApiError
-                ,errorMessage = resp.err
-                ,elapsed      = now() - startTime
-            )
-            a.emitEvent(apiErrEvent)
-            this_tick_result.events.add(apiErrEvent)
-
-            this_tick_result.error   = some(resp.err)
-            this_tick_result.elapsed = now() - startTime
-            this_tick_result.done    = false
-
-            appendToJsonFile(a.artifactsDir / "events.json"         ,   %this_tick_result.events )
-            appendToJsonFile(a.artifactsDir / "all_responses.json"  ,   %allResponses            )
-            appendToJsonFile(a.artifactsDir / "all_requests.json"   ,   %allReqOpts              )
-            return this_tick_result
-
-    # Final assistant message
-    let 
-        text                  = resp.val.extractText()
-        msgEvent              = a.MessageEvent(
-            tokensUsed        = resp.val.usage.get.totalTokens
-            ,cumulativeTokens = totalTokensUsed.combined
-            ,elapsed          = now() - startTime
-            ,msgText          = text
-        )
-
-    a.totalTokensUsed = totalTokensUsed
-    a.emitEvent(msgEvent)
-
-    this_tick_result.events.add(msgEvent)
-    this_tick_result.text       = text
-    this_tick_result.tokensUsed = totalTokensUsed.combined
-    this_tick_result.elapsed    = now() - startTime
-    this_tick_result.done       = true
-
-    # Persist session state
-    a.session.lastResponseId = some(resp.val.id)
-    if text.len > 0:
-        a.session.messages.add builders.assistantMessage(text)
-
-    appendToJsonFile(a.artifactsDir / "events.json"         ,   %this_tick_result.events )
-    appendToJsonFile(a.artifactsDir / "all_responses.json"  ,   %allResponses            )
-    appendToJsonFile(a.artifactsDir / "all_requests.json"   ,   %allReqOpts              )
-    writeFile(a.artifactsDir / "finalOutput.md",     text)
-
-    # ===== C: POST-TURN REFLECTION =====
-    if a.enableReflection: await a.runReflection(resp.val.id)
-
-    return this_tick_result
 
 proc ask*(
     a  : Agent
     ,q : string
     ,maxToolCalls = 0
 ): Future[string] {.async.} =
-    let res = await chatTurn(a,q)
-    if res.error.isSome:
-        return "Error: " & res.error.get()
-    return res.text
+    ic "ask()", q
+    let r = await chatTurn(a, q, maxToolCalls = maxToolCalls)
+    if r.error.isSome:
+        icr "ask() error", r.error.get()
+        return "Error: " & r.error.get()
+    ic "ask() done", r.text.len
+    r.text
 
-proc askInSession*(
-    a             : Agent
-    ,q            : string
+proc ask*(
+    a     : Agent
+    ,input : UserInput
     ,maxToolCalls = 0
-    ,useChaining  = true
 ): Future[string] {.async.} =
-    let res = await a.chatTurn(
-        userText     = q
-        ,useChaining = useChaining
-        ,maxToolCalls = maxToolCalls
-    )
-    if res.error.isSome:
-        return "Error: " & res.error.get()
-    return res.text
+    ## Multimodal ask — accepts UserInput with images/files.
+    ic "ask(multimodal)", input.plainText
+    let r = await chatTurn(a, input, maxToolCalls = maxToolCalls)
+    if r.error.isSome:
+        icr "ask() error", r.error.get()
+        return "Error: " & r.error.get()
+    ic "ask() done", r.text.len
+    r.text
+
 
 proc chat*(
     a             : Agent
@@ -370,13 +562,36 @@ proc chat*(
     ,useChaining  = false
     ,maxToolCalls = 0
 ): Future[string] {.async.} =
-    let res           = await a.chatTurn(
+    ic "chat()", userText, useChaining, maxToolCalls
+    let r = await a.chatTurn(
         userText      = userText
         ,useChaining  = useChaining
         ,maxToolCalls = maxToolCalls
     )
-    if res.error.isSome:
-        return "Error: " & res.error.get()
-    return res.text
+    if r.error.isSome:
+        icr "chat() error", r.error.get()
+        return "Error: " & r.error.get()
+    ic "chat() done", r.text.len
+    r.text
 
-include chat_repl 
+proc chat*(
+    a             : Agent
+    ,input        : UserInput
+    ,useChaining  = false
+    ,maxToolCalls = 0
+): Future[string] {.async.} =
+    ## Multimodal chat — accepts UserInput with images/files.
+    ic "chat(multimodal)", input.plainText, useChaining, maxToolCalls
+    let r = await a.chatTurn(
+        input         = input
+        ,useChaining  = useChaining
+        ,maxToolCalls = maxToolCalls
+    )
+    if r.error.isSome:
+        icr "chat() error", r.error.get()
+        return "Error: " & r.error.get()
+    ic "chat() done", r.text.len
+    r.text
+
+
+include chat_repl_classic

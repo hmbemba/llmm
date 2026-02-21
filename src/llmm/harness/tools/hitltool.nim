@@ -47,7 +47,6 @@ proc HITLTool*(handler: HITLHandler = defaultCLIHandler): Tool =
 
             # Synchronously get input right here
             let response = h(question, context)
-            return %*{"status": "success", "response": response}
-
+            return toolSuccess(%*{"response": response}, message = "Human responded")
 
     )

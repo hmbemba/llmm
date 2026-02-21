@@ -37,7 +37,7 @@ proc createResponseRaw*(
     ## https://platform.openai.com/docs/api-reference/responses/create
     ## Creates a model response - returns raw JSON string
     let opts = toOptJson(options)
-    icb opts
+    #icb opts
     result = await client.post("/responses", opts)
 
 proc createResponse*(

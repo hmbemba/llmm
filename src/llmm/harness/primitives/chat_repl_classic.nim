@@ -1,0 +1,1436 @@
+# =============================================================================
+# chat_repl_classic.nim - Stylish interactive chat REPL for llmm agents
+# =============================================================================
+#
+# Replaces the chatRepl section of tick.nim with a rich terminal UI.
+# Uses nimsterm for styled output + std/terminal for dimensions.
+#
+# SQLite-backed persistence: Chat history is persisted via AgentStore.
+# On startup, prior sessions can be loaded from the database.
+# During the session, chatTurn() handles all DB writes — this file
+# only manages display and user interaction.
+#
+# Slash commands:
+#   /help, /paste, /clip, /sh, /!, /history, /dbhistory, /save,
+#   /clear, /debug, /stats, /timestamps, /wrap, /width, /cfg
+#
+# Compile flags:
+#   -d:llmm_repl_termui     Enable termui spinner (requires --threads:on)
+#   -d:llmm_repl_clipboard  Enable /clip command
+#   -d:llmm_repl_debug      Default debug mode ON
+#   -d:llmm_repl_stats      Default stats mode ON
+#
+# =============================================================================
+
+# import std/[
+# json
+# ,times
+# ,options
+# ,asyncdispatch
+# ,strformat
+# ,strutils
+# ,sugar
+# ,tables
+# ,terminal
+# ,os
+# ,sequtils
+# ]
+
+# import rz, ic
+# import agent, sessions, store
+# import ../tools/base
+# import ../../general_helpers
+# import ../../providers/oai/oai_client
+# import ../../providers/oai/common/types
+# import ../../providers/oai/utils/builders
+# import ../../providers/oai/responses/types
+# import ../../providers/oai/responses/api
+# import ../../providers/oai/responses/utils
+
+# import ./mem/[memory, tool]
+
+# We import nimsterm for styled output
+import nimsterm
+import terminal
+import std/osproc  # For /sh and /! shell command execution
+import std/os      # For getEnv, getCurrentDir, getHomeDir (shell prompt)
+import std/algorithm  # For sortedByIt (search results ranking)
+
+when defined(llmm_repl_clipboard):
+  import libclip/clipboard
+#discard setClipboardText "text here"
+#let content = getClipboardText()
+
+
+when defined(llmm_repl_termui):
+  import termui
+
+
+# Re-export TickResult if not already visible from tick
+# (or just import tick and use its TickResult)
+
+# =============================================================================
+# REPL Configuration & State
+# =============================================================================
+
+type
+  ReplSettings* = object
+    showDebug*      : bool   ## Show tool calls and internal events
+    showStats*      : bool   ## Show token/time footer after each response
+    showTimestamp*  : bool   ## Show timestamps on messages
+    wordWrap*       : bool   ## Word-wrap output to terminal width
+    maxWidth*       : int    ## Max content width (0 = auto from terminal)
+    theme*          : ReplTheme
+    loadHistory*    : bool   ## Load prior chat history from SQLite on startup
+    maxHistoryLoad* : int    ## Max number of prior messages to load (0 = all)
+
+  ReplTheme* = object
+    ## Color scheme for the REPL. All fields are nimsterm Color values.
+    userLabel*      : Color
+    userText*       : Color
+    assistantLabel* : Color
+    assistantText*  : Color
+    toolLabel*      : Color
+    toolText*       : Color
+    errorLabel*     : Color
+    errorText*      : Color
+    metaText*       : Color
+    statText*       : Color
+    headerAccent*   : Color
+    dividerColor*   : Color
+    promptArrow*    : Color
+    shellUser*      : Color
+    shellPath*      : Color
+    shellExitCode*  : Color
+    shellMarker*    : Color
+    searchMatch*    : Color   ## Highlighted matching chars in /search results
+
+  ReplMessage* = object
+    role*      : string   # "user" | "assistant" | "tool" | "error" | "meta"
+    name*      : string
+    text*      : string
+    timestamp* : DateTime
+    tokens*    : int
+    elapsed*   : Duration
+
+  ReplState* = object
+    settings*     : ReplSettings
+    history*      : seq[ReplMessage]
+    running*      : bool
+    lastExitCode* : int    ## Exit code from the last /sh or /! command
+
+# =============================================================================
+# Default Theme - Clean dark terminal aesthetic
+# =============================================================================
+
+proc defaultTheme*(): ReplTheme =
+  ReplTheme(
+    userLabel      : cyan
+    ,userText      : white
+    ,assistantLabel : green
+    ,assistantText  : white
+    ,toolLabel      : yellow
+    ,toolText       : brightBlack
+    ,errorLabel     : red
+    ,errorText      : red
+    ,metaText       : brightBlack
+    ,statText       : brightBlack
+    ,headerAccent   : cyan
+    ,dividerColor   : brightBlack
+    ,promptArrow    : cyan
+    ,shellUser      : green
+    ,shellPath      : cyan
+    ,shellExitCode  : red
+    ,shellMarker    : white
+    ,searchMatch    : yellow
+  )
+
+proc defaultSettings*(): ReplSettings =
+  ReplSettings(
+    showDebug      : defined(llmm_repl_debug)
+    ,showStats     : defined(llmm_repl_stats) or true
+    ,showTimestamp  : false
+    ,wordWrap      : true
+    ,maxWidth      : 0
+    ,theme         : defaultTheme()
+    ,loadHistory   : true
+    ,maxHistoryLoad: 100
+  )
+
+proc initReplState*(): ReplState =
+  ReplState(
+    settings : defaultSettings()
+    ,history : @[]
+    ,running : true
+    ,lastExitCode : 0
+  )
+
+# =============================================================================
+# Terminal Helpers
+# =============================================================================
+
+proc getContentWidth(s: ReplSettings): int =
+  ## Returns the content width to use for wrapping.
+  if s.maxWidth > 0: return s.maxWidth
+  let tw = terminalWidth()
+  if tw > 10: tw - 4  # Leave some margin
+  else: 76             # Safe fallback
+
+proc wrapText*(text: string, width: int, indent: int = 0): string =
+  ## Word-wrap text to given width with optional indent.
+  ## Respects existing newlines.
+  let indentStr = " ".repeat(indent)
+  let effectiveWidth = width - indent
+  if effectiveWidth <= 10: return text
+
+  var lines: seq[string] = @[]
+  for paragraph in text.split('\n'):
+    if paragraph.strip().len == 0:
+      lines.add ""
+      continue
+
+    var currentLine = ""
+    for word in paragraph.splitWhitespace():
+      if currentLine.len == 0:
+        currentLine = word
+      elif currentLine.len + 1 + word.len <= effectiveWidth:
+        currentLine &= " " & word
+      else:
+        lines.add(indentStr & currentLine)
+        currentLine = word
+
+    if currentLine.len > 0:
+      lines.add(indentStr & currentLine)
+
+  result = lines.join("\n")
+
+proc thinDivider(width: int, color: Color = brightBlack) =
+  echo $styled("─".repeat(width)).fg(color).style(dim)
+
+proc thickDivider(width: int, color: Color = brightBlack) =
+  echo $styled("━".repeat(width)).fg(color)
+
+# =============================================================================
+# Formatted Message Printing
+# =============================================================================
+
+proc printHeader*(agentName: string, theme: ReplTheme, width: int) =
+  ## Print the chat session header.
+  echo ""
+  let topBar = "╭" & "─".repeat(width - 2) & "╮"
+  let botBar = "╰" & "─".repeat(width - 2) & "╯"
+
+  echo $styled(topBar).fg(theme.headerAccent).style(dim)
+
+  let title = &"  💬  Chat with {agentName}"
+  let padding = max(0, width - 2 - title.len)
+  echo $styled("│").fg(theme.headerAccent).style(dim) &
+       $styled(title).fg(theme.headerAccent).style(bold) &
+       " ".repeat(padding) &
+       $styled("│").fg(theme.headerAccent).style(dim)
+
+  echo $styled(botBar).fg(theme.headerAccent).style(dim)
+  echo ""
+
+  # Quick help line
+  echo $styled("  Type ").fg(theme.metaText) &
+       $styled("/help").fg(cyan).style(bold) &
+       $styled(" for commands  •  ").fg(theme.metaText) &
+       $styled("exit").fg(cyan).style(bold) &
+       $styled(" to quit  •  ").fg(theme.metaText) &
+       $styled("paste multi-line directly").fg(theme.metaText)
+  echo ""
+
+proc printUserMessage*(msg: string, theme: ReplTheme, width: int, ts: DateTime, showTs: bool) =
+  ## Print a user message in styled format.
+  let tsStr = if showTs: $styled(" " & ts.format("HH:mm")).fg(theme.metaText).style(dim) else: ""
+
+  echo $styled("  You ").fg(theme.userLabel).style(bold) & tsStr
+  let wrapped = wrapText(msg, width, indent = 4)
+  for line in wrapped.split('\n'):
+    echo $styled(line).fg(theme.userText)
+  echo ""
+
+proc printAssistantMessage*(name, msg: string, theme: ReplTheme, width: int,
+                            ts: DateTime, showTs: bool, tokens: int, elapsed: Duration,
+                            showStats: bool) =
+  ## Print an assistant message in styled format.
+  let tsStr = if showTs: $styled(" " & ts.format("HH:mm")).fg(theme.metaText).style(dim) else: ""
+
+  echo $styled(&"  {name} ").fg(theme.assistantLabel).style(bold) & tsStr
+  let wrapped = wrapText(msg, width, indent = 4)
+  for line in wrapped.split('\n'):
+    echo $styled(line).fg(theme.assistantText)
+
+  if showStats and (tokens > 0 or elapsed > DurationZero):
+    let elapsedMs = elapsed.inMilliseconds
+    let statsLine = &"    ⏱ {elapsedMs}ms  •  📊 {tokens} tokens"
+    echo $styled(statsLine).fg(theme.statText).style(dim)
+
+  echo ""
+
+proc printToolCall*(toolName, args: string, theme: ReplTheme) =
+  ## Print a tool call event (debug mode).
+  echo $styled("    ⚡ ").fg(theme.toolLabel) &
+       $styled(toolName).fg(theme.toolLabel).style(bold) &
+       $styled("(").fg(theme.toolText) &
+       $styled(args.substr(0, min(args.len - 1, 80))).fg(theme.toolText).style(dim) &
+       $styled(if args.len > 80: "…)" else: ")").fg(theme.toolText)
+
+proc printToolResult*(toolId: string, ok: bool, output: string, theme: ReplTheme) =
+  ## Print a tool result event (debug mode).
+  let icon   = if ok: "✓" else: "✗"
+  let color  = if ok: nimsterm.green else: nimsterm.red  
+  let preview = output.substr(0, min(output.len - 1, 60)).replace("\n", " ")
+  echo $styled(&"    {icon} ").fg(color) &
+       $styled(preview).fg(theme.toolText).style(dim) &
+       (if output.len > 60: $styled("…").fg(theme.toolText) else: "")
+
+proc printError*(msg: string, theme: ReplTheme) =
+  ## Print an error message.
+  echo $styled("  ✗ Error: ").fg(theme.errorLabel).style(bold) &
+       $styled(msg).fg(theme.errorText)
+  echo ""
+
+proc printMeta*(msg: string, theme: ReplTheme) =
+  ## Print a meta/system message.
+  echo $styled(&"  ℹ {msg}").fg(theme.metaText).style(dim)
+  echo ""
+
+# =============================================================================
+# Help Screen
+# =============================================================================
+
+proc printHelp*(theme: ReplTheme, width: int) =
+  echo ""
+  echo $styled("  Commands").fg(theme.headerAccent).style(bold, underline)
+  echo ""
+
+  let cmds = @[
+    ("/help",           "Show this help"),
+    ("/paste",          "Enter paste mode (end with /end)"),
+    ("/clip",           "Send clipboard as message"),
+    ("/sh <command>",   "Run a shell command (captured output)"),
+    ("/! <command>",    "Run interactive shell command (full terminal)"),
+    ("/search <query>", "Fuzzy search chat history"),
+    ("/history [n]",    "Show last n exchanges (default 5)"),
+    ("/dbhistory [n]",  "Show last n messages from SQLite (all sessions)"),
+    ("/save <path>",    "Save transcript to file"),
+    ("/clear",          "Clear screen and reprint header"),
+    ("/debug",          "Toggle tool-call visibility"),
+    ("/stats",          "Toggle token/time stats"),
+    ("/timestamps",     "Toggle timestamps"),
+    ("/wrap",           "Toggle word wrapping"),
+    ("/width <n>",      "Set max content width (0=auto)"),
+    ("/cfg",           "Show current agent + REPL configuration"),
+    ("exit / quit / q", "End session"),
+  ]
+
+  for (cmd, desc) in cmds:
+    let padded = cmd & " ".repeat(max(1, 22 - cmd.len))
+    echo $styled("    ").fg(theme.metaText) &
+         $styled(padded).fg(cyan).style(bold) &
+         $styled(desc).fg(theme.metaText)
+
+  echo ""
+
+# =============================================================================
+# Shell Prompt & Command Execution
+# =============================================================================
+
+proc getShortHome(path: string): string =
+  ## Collapse the home directory portion to ~ like a real shell prompt.
+  let home = getHomeDir().strip(trailing = true, chars = {DirSep, AltSep})
+  if path.startsWith(home):
+    result = "~" & path[home.len .. ^1]
+  else:
+    result = path
+
+proc shellPrompt*(theme: ReplTheme, exitCode: int): string =
+  ## Build a shell-style prompt: user@host cwd [exitcode] @#
+  ## Exit code bracket is only shown when non-zero (like real shells).
+  let user = getEnv("USERNAME", getEnv("USER", "user"))
+  when defined(windows):
+    let host = getEnv("COMPUTERNAME", "host")
+  else:
+    let host = getEnv("HOSTNAME", getEnv("HOST", "host"))
+  let cwd = getCurrentDir().getShortHome()
+
+  result = $styled(user & "@" & host).fg(theme.shellUser).style(bold) &
+           " " &
+           $styled(cwd).fg(theme.shellPath).style(bold)
+
+  if exitCode != 0:
+    result &= " " & $styled(&"[{exitCode}]").fg(theme.shellExitCode).style(bold)
+
+  result &= " " & $styled("@#").fg(theme.shellMarker).style(bold)
+
+proc runShellCommand*(command: string, theme: ReplTheme, interactive: bool = false, lastExitCode: int = 0): int =
+  ## Execute a shell command. Returns exit code.
+  ##
+  ## When interactive=false (default, /sh): captures stdout+stderr and
+  ## displays output inline with indented formatting.
+  ##
+  ## When interactive=true (/!): shows a shell prompt with cwd, then
+  ## hands over the full terminal to the subprocess so interactive TUIs,
+  ## prompts, and pagers work correctly. The REPL regains control once
+  ## the subprocess exits.
+  result = 0
+
+  if command.strip().len == 0:
+    printError("Usage: /sh <command>  or  /! <command>", theme)
+    return 0
+
+  if interactive:
+    # Show shell-style prompt line before the command
+    echo "  " & shellPrompt(theme, lastExitCode) & " " & $styled(command).fg(theme.toolText)
+
+    # Hand over the terminal — stdin/stdout/stderr all go to the subprocess.
+    try:
+      result = execShellCmd(command)
+      if result != 0:
+        echo $styled(&"  exit code: {result}").fg(theme.errorText).style(dim)
+    except OSError, IOError:
+      printError(&"Failed to run command: {getCurrentExceptionMsg()}", theme)
+      result = 1
+  else:
+    # Captured mode — show simple $ prefix
+    echo $styled("  $ ").fg(theme.toolLabel).style(bold) &
+         $styled(command).fg(theme.toolText)
+
+    try:
+      let (output, exitCode) = execCmdEx(command)
+      result = exitCode
+      if output.len > 0:
+        for line in output.strip(trailing = true).split('\n'):
+          echo $styled("    " & line).fg(theme.metaText)
+
+      if exitCode != 0:
+        echo $styled(&"    exit code: {exitCode}").fg(theme.errorText).style(dim)
+    except OSError, IOError:
+      printError(&"Failed to run command: {getCurrentExceptionMsg()}", theme)
+      result = 1
+
+  echo ""
+
+# =============================================================================
+# Fuzzy Search
+# =============================================================================
+#
+# Subsequence fuzzy matcher inspired by fzf's scoring model.
+# Rewards: consecutive matches, matches after separators (space, _, -),
+#          matches at start of text, case-exact matches.
+# Penalties: gaps between matched characters.
+#
+# Returns (score, matchedIndices) where score <= 0 means no match.
+
+type
+  FuzzyResult* = object
+    score*   : int
+    indices* : seq[int]  ## Indices in haystack where pattern chars matched
+
+  SearchHit* = object
+    msgIdx*    : int       ## Index into history or db row
+    role*      : string
+    name*      : string
+    text*      : string
+    timestamp* : DateTime
+    tokens*    : int
+    elapsed*   : Duration
+    score*     : int
+    indices*   : seq[int]  ## Match positions in text (for highlighting)
+    source*    : string    ## "session" or "db"
+
+# proc fuzzyMatch*(pattern, haystack: string): FuzzyResult =
+#   ## Fuzzy-match pattern against haystack using subsequence matching.
+#   ## Returns score > 0 and matched indices on success, score <= 0 on failure.
+#   if pattern.len == 0:
+#     return FuzzyResult(score: 0, indices: @[])
+
+#   let pLow = pattern.toLowerAscii()
+#   let hLow = haystack.toLowerAscii()
+
+#   # First pass: can we match at all? (greedy forward scan)
+#   var matchIndices = newSeqOfCap[int](pattern.len)
+#   var pi = 0
+#   for hi in 0 ..< haystack.len:
+#     if pi < pLow.len and hLow[hi] == pLow[pi]:
+#       matchIndices.add(hi)
+#       inc pi
+#   if pi < pLow.len:
+#     return FuzzyResult(score: 0, indices: @[])  # Not all chars matched
+
+#   # Score the match
+#   const
+#     bonusConsecutive   = 8
+#     bonusSeparator     = 10  # Match right after space, _, -, /
+#     bonusFirstChar     = 12
+#     bonusCaseExact     = 4
+#     penaltyGap         = -3
+#     penaltyLeading     = -1  # Per char before first match (capped)
+#     maxLeadingPenalty  = -12
+
+#   var score = 0
+#   var prevIdx = -2  # Sentinel so first char isn't "consecutive"
+
+#   for i, hi in matchIndices:
+#     # Consecutive bonus
+#     if hi == prevIdx + 1:
+#       score += bonusConsecutive
+#     elif i > 0:
+#       # Gap penalty proportional to distance
+#       let gap = hi - prevIdx - 1
+#       score += penaltyGap * gap
+
+#     # Separator bonus: match right after a word boundary
+#     if hi == 0:
+#       score += bonusFirstChar
+#     elif hi > 0:
+#       let prev = haystack[hi - 1]
+#       if prev in {' ', '_', '-', '/', '\\', '.', ',', ':', ';', '(', '[', '{'}:
+#         score += bonusSeparator
+
+#     # Case-exact bonus
+#     if pattern.len > i and haystack[hi] == pattern[i]:
+#       score += bonusCaseExact
+
+#     prevIdx = hi
+
+#   # Leading gap penalty (penalize matches that start deep into the string)
+#   if matchIndices.len > 0:
+#     let leading = matchIndices[0]
+#     score += max(penaltyLeading * leading, maxLeadingPenalty)
+
+#   # Ensure score is at least 1 for any valid match
+#   if score <= 0: score = 1
+
+#   return FuzzyResult(score: score, indices: matchIndices)
+
+
+proc fuzzyMatchAll*(pattern, haystack: string): FuzzyResult =
+  ## Finds the BEST occurrence of pattern in haystack (not just first).
+  ## Scores all candidate matches and returns the highest.
+  if pattern.len == 0:
+    return FuzzyResult(score: 0, indices: @[])
+
+  let pLow = pattern.toLowerAscii()
+  let hLow = haystack.toLowerAscii()
+
+  # Collect all starting positions where first pattern char matches
+  var startPositions: seq[int] = @[]
+  for i in 0 ..< hLow.len:
+    if hLow[i] == pLow[0]:
+      startPositions.add i
+
+  if startPositions.len == 0:
+    return FuzzyResult(score: 0, indices: @[])
+
+  const
+    bonusConsecutive  = 8
+    bonusSeparator    = 10
+    bonusFirstChar    = 12
+    bonusCaseExact    = 4
+    penaltyGap        = -3
+    penaltyLeading    = -1
+    maxLeadingPenalty = -8   # Reduced from -12
+
+  var bestScore = 0
+  var bestIndices: seq[int] = @[]
+
+  for startPos in startPositions:
+    # Greedy forward match from this start position
+    var matchIndices: seq[int] = @[]
+    var pi = 0
+    for hi in startPos ..< hLow.len:
+      if pi < pLow.len and hLow[hi] == pLow[pi]:
+        matchIndices.add hi
+        inc pi
+    if pi < pLow.len: continue  # Couldn't complete pattern from this start
+
+    # Score this match
+    var score = 0
+    var prevIdx = startPos - 2
+
+    for i, hi in matchIndices:
+      if hi == prevIdx + 1:
+        score += bonusConsecutive
+      elif i > 0:
+        let gap = hi - prevIdx - 1
+        score += penaltyGap * gap
+
+      if hi == 0:
+        score += bonusFirstChar
+      elif hi > 0:
+        let prev = haystack[hi - 1]
+        if prev in {' ', '_', '-', '/', '\\', '.', ',', ':', ';', '(', '[', '{', '\n'}:
+          score += bonusSeparator
+
+      if pattern.len > i and haystack[hi] == pattern[i]:
+        score += bonusCaseExact
+
+      prevIdx = hi
+
+    # Reduced leading penalty
+    if matchIndices.len > 0:
+      let leading = matchIndices[0]
+      score += max(penaltyLeading * leading, maxLeadingPenalty)
+
+    if score <= 0: score = 1
+
+    if score > bestScore:
+      bestScore = score
+      bestIndices = matchIndices
+
+  # Frequency bonus: reward messages with multiple occurrences
+  var occurrences = 0
+  var searchPos = 0
+  while searchPos <= hLow.len - pLow.len:
+    if hLow[searchPos ..< searchPos + pLow.len] == pLow:
+      inc occurrences
+      searchPos += pLow.len
+    else:
+      inc searchPos
+  if occurrences > 1:
+    bestScore += min((occurrences - 1) * 5, 20)  # Cap frequency bonus at +20
+
+  return FuzzyResult(score: bestScore, indices: bestIndices)
+
+proc highlightMatch*(text: string, indices: seq[int], matchColor: Color, baseColor: Color, maxLen: int = 120): string =
+  ## Render a text snippet with fuzzy-matched characters highlighted.
+  ## Truncates to maxLen, centering around the first match region.
+
+  # Collapse text to single line for display
+  var flat = text.replace("\n", " ").replace("\r", "")
+
+  # Determine display window around the match
+  var startPos = 0
+  var endPos = flat.len
+  if flat.len > maxLen and indices.len > 0:
+    # Center window around first match
+    let center = indices[0]
+    startPos = max(0, center - maxLen div 3)
+    endPos = min(flat.len, startPos + maxLen)
+    if startPos > 0:
+      startPos = max(0, startPos)  # Ensure valid
+
+  let snippet = flat[startPos ..< endPos]
+  let prefix = if startPos > 0: "…" else: ""
+  let suffix = if endPos < flat.len: "…" else: ""
+
+  # Build a set of match positions adjusted for the window
+  var matchSet: set[uint16] = {}
+  for idx in indices:
+    let adjusted = idx - startPos
+    if adjusted >= 0 and adjusted < snippet.len and adjusted <= high(uint16).int:
+      matchSet.incl(adjusted.uint16)
+
+  # Render character by character
+  result = prefix
+  for i, ch in snippet:
+    if i.uint16 in matchSet:
+      result &= $styled($ch).fg(matchColor).style(bold)
+    else:
+      result &= $styled($ch).fg(baseColor)
+  result &= suffix
+
+proc searchHistory*(state: ReplState, query: string, agentName: string,
+                    agentStore: AgentStore = nil, maxResults: int = 15) =
+  ## Fuzzy-search chat history and display ranked results.
+  ## Searches in-memory session history first, then DB history if available.
+  let theme = state.settings.theme
+  let width = state.settings.getContentWidth()
+
+  if query.strip().len == 0:
+    printError("Usage: /search <query>", theme)
+    return
+
+  var hits: seq[SearchHit] = @[]
+
+  # Search in-memory session history
+  for i, msg in state.history:
+    if msg.role notin ["user", "assistant"]: continue
+    let fr = fuzzyMatchAll(query, msg.text)
+    if fr.score > 0:
+      hits.add SearchHit(
+        msgIdx:    i,
+        role:      msg.role,
+        name:      msg.name,
+        text:      msg.text,
+        timestamp: msg.timestamp,
+        tokens:    msg.tokens,
+        elapsed:   msg.elapsed,
+        score:     fr.score,
+        indices:   fr.indices,
+        source:    "session",
+      )
+
+  # Search DB history if available (avoid duplicates with session)
+  if not agentStore.isNil:
+    let rows = agentStore.getChatHistory(500)
+    # We already have session messages, so only add DB rows
+    # that don't overlap with in-memory history.
+    # Simple heuristic: skip if text already seen in session hits.
+    var seenTexts: seq[string] = @[]
+    for h in hits:
+      seenTexts.add h.text
+
+    for i, row in rows:
+      if row.role notin ["user", "assistant"]: continue
+      let fr = fuzzyMatchAll(query, row.content)
+      if fr.score > 0:
+        # Skip if we already have this exact text from session
+        var isDupe = false
+        for seen in seenTexts:
+          if seen == row.content:
+            isDupe = true
+            break
+        if isDupe: continue
+
+        var ts = now()
+        try:
+          ts = parse(row.ts, "yyyy-MM-dd'T'HH:mm:sszzz", utc())
+        except CatchableError:
+          try:
+            ts = parse(row.ts, "yyyy-MM-dd HH:mm:ss", utc())
+          except CatchableError:
+            discard
+
+        hits.add SearchHit(
+          msgIdx:    i,
+          role:      row.role,
+          name:      if row.role == "assistant": agentName else: "",
+          text:      row.content,
+          timestamp: ts,
+          tokens:    row.tokensUsed,
+          elapsed:   initDuration(milliseconds = row.elapsedMs),
+          score:     fr.score,
+          indices:   fr.indices,
+          source:    "db",
+        )
+
+  if hits.len == 0:
+    printMeta(&"No matches for \"{query}\"", theme)
+    return
+
+  # Sort by score descending
+  hits.sort(proc(a, b: SearchHit): int = cmp(b.score, a.score))
+
+  # Cap results
+  let showCount = min(maxResults, hits.len)
+  let totalCount = hits.len
+
+  echo ""
+  printMeta(&"Found {totalCount} matches for \"{query}\" (showing top {showCount}):", theme)
+  thinDivider(width, theme.dividerColor)
+
+  for i in 0 ..< showCount:
+    let hit = hits[i]
+    let ts = hit.timestamp.format("MM-dd HH:mm")
+    let roleLabel = case hit.role
+      of "user": "You"
+      of "assistant": hit.name
+      else: hit.role
+    let roleColor = case hit.role
+      of "user": theme.userLabel
+      of "assistant": theme.assistantLabel
+      else: theme.metaText
+    let sourceTag = if hit.source == "db": $styled(" [db]").fg(theme.metaText).style(dim) else: ""
+    let scoreTag = $styled(&" ({hit.score})").fg(theme.statText).style(dim)
+
+    # Header: role, timestamp, source, score
+    echo $styled(&"  {i+1}. ").fg(theme.metaText) &
+         $styled(roleLabel).fg(roleColor).style(bold) &
+         $styled(&" {ts}").fg(theme.metaText).style(dim) &
+         sourceTag & scoreTag
+
+    # Highlighted snippet
+    let snippet = highlightMatch(hit.text, hit.indices, theme.searchMatch, theme.metaText, maxLen = width - 8)
+    echo "     " & snippet
+    echo ""
+
+  if totalCount > showCount:
+    printMeta(&"...and {totalCount - showCount} more. Refine your query to narrow results.", theme)
+
+  thinDivider(width, theme.dividerColor)
+  echo ""
+
+# =============================================================================
+# History & Transcript
+# =============================================================================
+
+proc printHistory*(state: ReplState, n: int, agentName: string) =
+  let theme = state.settings.theme
+  let width = state.settings.getContentWidth()
+  let count = min(n, state.history.len)
+  if count == 0:
+    printMeta("No messages in history yet.", theme)
+    return
+
+  printMeta(&"Last {count} messages:", theme)
+  thinDivider(width, theme.dividerColor)
+
+  for i in (state.history.len - count) ..< state.history.len:
+    let msg = state.history[i]
+    case msg.role
+    of "user":
+      printUserMessage(msg.text, theme, width, msg.timestamp, showTs = true)
+    of "assistant":
+      printAssistantMessage(msg.name, msg.text, theme, width, msg.timestamp,
+                            showTs = true, tokens = msg.tokens,
+                            elapsed = msg.elapsed, showStats = state.settings.showStats)
+    of "error":
+      printError(msg.text, theme)
+    else:
+      printMeta(msg.text, theme)
+
+  thinDivider(width, theme.dividerColor)
+  echo ""
+
+proc printDbHistory*(agentStore: AgentStore, n: int, agentName: string, theme: ReplTheme, width: int, showStats: bool) =
+  ## Print chat history loaded directly from the SQLite database.
+  ## This shows messages across all sessions, not just the current one.
+  if agentStore.isNil:
+    printMeta("No database connected.", theme)
+    return
+
+  let rows = agentStore.getChatHistory(n)
+  if rows.len == 0:
+    printMeta("No messages in database yet.", theme)
+    return
+
+  printMeta(&"Last {rows.len} messages from database (all sessions):", theme)
+  thinDivider(width, theme.dividerColor)
+
+  # rows are newest-first; reverse for chronological display
+  for i in countdown(rows.high, 0):
+    let row = rows[i]
+    # Parse timestamp
+    var ts = now()
+    try:
+      ts = parse(row.ts, "yyyy-MM-dd'T'HH:mm:sszzz", utc())
+    except CatchableError:
+      try:
+        ts = parse(row.ts, "yyyy-MM-dd HH:mm:ss", utc())
+      except CatchableError:
+        discard
+
+    let elapsed = initDuration(milliseconds = row.elapsedMs)
+
+    case row.role
+    of "user":
+      printUserMessage(row.content, theme, width, ts, showTs = true)
+    of "assistant":
+      printAssistantMessage(agentName, row.content, theme, width, ts,
+                            showTs = true, tokens = row.tokensUsed,
+                            elapsed = elapsed, showStats = showStats)
+    of "error":
+      printError(row.content, theme)
+    else:
+      printMeta(row.content, theme)
+
+  thinDivider(width, theme.dividerColor)
+  echo ""
+
+proc saveTranscript*(state: ReplState, path: string, agentName: string) =
+  ## Save the conversation transcript as Markdown.
+  var md = &"# Chat with {agentName}\n"
+  md &= &"_Saved {now().format(\"yyyy-MM-dd HH:mm:ss\")}_\n\n---\n\n"
+
+  for msg in state.history:
+    let ts = msg.timestamp.format("HH:mm:ss")
+    case msg.role
+    of "user":
+      md &= &"**You** _{ts}_\n\n{msg.text}\n\n"
+    of "assistant":
+      md &= &"**{msg.name}** _{ts}_"
+      if msg.tokens > 0:
+        md &= &" ({msg.tokens} tokens, {msg.elapsed.inMilliseconds}ms)"
+      md &= &"\n\n{msg.text}\n\n"
+    of "error":
+      md &= &"> ⚠️ Error: {msg.text}\n\n"
+    else:
+      md &= &"_{msg.text}_\n\n"
+    md &= "---\n\n"
+
+  writeFile(path, md)
+
+proc saveTranscriptFromDb*(agentStore: AgentStore, path: string, agentName: string, limit: int = 500) =
+  ## Save the full conversation transcript from SQLite as Markdown.
+  ## Includes messages from all sessions.
+  if agentStore.isNil:
+    raise newException(IOError, "No database connected")
+
+  let rows = agentStore.getChatHistory(limit)
+  var md = &"# Chat with {agentName} (Full History)\n"
+  md &= &"_Saved {now().format(\"yyyy-MM-dd HH:mm:ss\")}_\n"
+  md &= &"_{rows.len} messages from database_\n\n---\n\n"
+
+  # rows are newest-first; reverse for chronological output
+  for i in countdown(rows.high, 0):
+    let row = rows[i]
+    let ts = row.ts
+    case row.role
+    of "user":
+      md &= &"**You** _{ts}_\n\n{row.content}\n\n"
+    of "assistant":
+      md &= &"**{agentName}** _{ts}_"
+      if row.tokensUsed > 0:
+        md &= &" ({row.tokensUsed} tokens, {row.elapsedMs}ms)"
+      md &= &"\n\n{row.content}\n\n"
+    of "error":
+      md &= &"> ⚠️ Error: {row.content}\n\n"
+    else:
+      md &= &"_{row.content}_\n\n"
+    md &= "---\n\n"
+
+  writeFile(path, md)
+
+# =============================================================================
+# SQLite History Loading
+# =============================================================================
+
+proc loadHistoryFromDb*(state: var ReplState, agentStore: AgentStore, agentName: string, theme: ReplTheme, width: int) =
+  ## Load prior chat history from the AgentStore SQLite database into
+  ## the REPL state and display it. Called once at startup.
+  if agentStore.isNil:
+    return
+
+  let limit = if state.settings.maxHistoryLoad > 0: state.settings.maxHistoryLoad else: 500
+  let rows = agentStore.getChatHistory(limit)
+
+  if rows.len == 0:
+    return
+
+  printMeta(&"Loading {rows.len} messages from previous sessions...", theme)
+  thinDivider(width, theme.dividerColor)
+
+  # rows are newest-first; reverse for chronological display
+  for i in countdown(rows.high, 0):
+    let row = rows[i]
+
+    # Parse timestamp
+    var ts = now()
+    try:
+      ts = parse(row.ts, "yyyy-MM-dd'T'HH:mm:sszzz", utc())
+    except CatchableError:
+      try:
+        ts = parse(row.ts, "yyyy-MM-dd HH:mm:ss", utc())
+      except CatchableError:
+        discard
+
+    let elapsed = initDuration(milliseconds = row.elapsedMs)
+
+    # Add to in-memory history
+    state.history.add ReplMessage(
+      role:      row.role,
+      name:      if row.role == "assistant": agentName else: "",
+      text:      row.content,
+      timestamp: ts,
+      tokens:    row.tokensUsed,
+      elapsed:   elapsed,
+    )
+
+    # Display the loaded message
+    case row.role
+    of "user":
+      printUserMessage(row.content, theme, width, ts, showTs = true)
+    of "assistant":
+      printAssistantMessage(agentName, row.content, theme, width, ts,
+                            showTs = true, tokens = row.tokensUsed,
+                            elapsed = elapsed, showStats = state.settings.showStats)
+    of "error":
+      printError(row.content, theme)
+    else:
+      discard
+
+  thinDivider(width, theme.dividerColor)
+  printMeta("End of previous session history", theme)
+  echo ""
+
+# =============================================================================
+# Input Handling (reused from tick.nim patterns)
+# =============================================================================
+
+const
+  BpEnable  = "\x1b[?2004h"
+  BpDisable = "\x1b[?2004l"
+  BpStart   = "\x1b[200~"
+  BpEnd     = "\x1b[201~"
+
+when defined(windows):
+  proc kbhit(): cint {.importc: "_kbhit", header: "<conio.h>".}
+
+  proc replReadPasteAware*(timeoutMs: int = 50): string =
+    result = stdin.readLine()
+    while true:
+      sleep(timeoutMs)
+      if kbhit() == 0: break
+      result.add "\n" & stdin.readLine()
+else:
+  import std/selectors
+
+  proc replReadPasteAware*(timeoutMs: int = 50): string =
+    result = stdin.readLine()
+    let sel = newSelector[int]()
+    sel.registerHandle(stdin.getFileHandle().int, {Read}, 0)
+    defer: sel.close()
+    while true:
+      let ready = sel.select(timeoutMs)
+      if ready.len == 0: break
+      result.add "\n" & stdin.readLine()
+
+proc replEnableBracketedPaste() =
+  stdout.write BpEnable
+  stdout.flushFile()
+
+proc replDisableBracketedPaste() =
+  stdout.write BpDisable
+  stdout.flushFile()
+
+proc replReadBlock(): string =
+  var line = stdin.readLine()
+  if line.contains(BpStart):
+    var lines: seq[string] = @[]
+    line = line.replace(BpStart, "")
+    while true:
+      if line.contains(BpEnd):
+        lines.add line.replace(BpEnd, "")
+        break
+      lines.add line
+      line = stdin.readLine()
+    return lines.join("\n")
+  return line
+
+proc readUserInput(): string =
+  ## Try bracketed paste first, fall back to paste-aware reader.
+  result = replReadBlock()
+  if result.len == 0:
+    result = replReadPasteAware()
+
+# =============================================================================
+# Prompt
+# =============================================================================
+
+proc showPrompt*(theme: ReplTheme, lastExitCode: int = 0) =
+  ## Show the input prompt with shell context line above the arrow.
+  ## Format:
+  ##   user@host ~/path [exitcode] @#
+  ##   ❯ _
+  echo "  " & shellPrompt(theme, lastExitCode)
+  stdout.write $styled("  ❯ ").fg(theme.promptArrow).style(bold)
+  stdout.flushFile()
+
+# =============================================================================
+# Waiting / Thinking Indicator
+# =============================================================================
+
+proc replWaitForTurn*(a: Agent, fut: Future[TickResult], theme: ReplTheme): TickResult =
+  ## Wait for a chatTurn to complete, showing a spinner/indicator.
+  when defined(llmm_repl_termui):
+    let spinner = termuiSpinner(&"{a.cfg.name} is thinking...")
+    while not fut.finished:
+      asyncdispatch.poll(50)
+    let res = fut.read()
+    if res.error.isSome:
+      spinner.fail(res.error.get())
+    else:
+      spinner.complete("Done")
+    return res
+  else:
+    # Simple animated dots fallback
+    stdout.write $styled(&"{a.cfg.name} is thinking").fg(theme.metaText).style(dim)
+    stdout.flushFile()
+    var dots = 0
+    while not fut.finished:
+      asyncdispatch.poll(100)
+      dots = (dots + 1) mod 4
+      stdout.write "\r"
+      stdout.write $styled(&"{a.cfg.name} is thinking" & ".".repeat(dots) & " ".repeat(3 - dots)).fg(theme.metaText).style(dim)
+      stdout.flushFile()
+
+    # Clear the thinking line
+    stdout.write "\r"
+    stdout.eraseLine()
+    stdout.flushFile()
+    return fut.read()
+
+# =============================================================================
+# Process TickResult into display
+# =============================================================================
+
+proc displayTickResult*(res: TickResult, agentName: string, state: var ReplState) =
+  ## Process and display a TickResult with full event visibility.
+  ## NOTE: chatTurn() already persists to SQLite — we only update in-memory
+  ## state and display here.
+  let theme = state.settings.theme
+  let width = state.settings.getContentWidth()
+
+  # Show tool calls in debug mode
+  if state.settings.showDebug and res.toolCalls.len > 0:
+    echo ""
+    echo $styled("    ── Tools ──").fg(theme.toolLabel).style(dim)
+    for i, ev in res.events:
+      case ev.kind
+      of aekToolCall:
+        printToolCall(ev.callToolName, $ev.callToolArgs, theme)
+      of aekToolResult:
+        let ok = ev.resultOk
+        printToolResult(ev.resultToolId, ok, $ev.resultOutput, theme)
+      else:
+        discard
+    echo $styled("    ───────────").fg(theme.toolLabel).style(dim)
+    echo ""
+
+  # Show assistant response
+  if res.error.isSome:
+    printError(res.error.get(), theme)
+    state.history.add ReplMessage(
+      role: "error", text: res.error.get(), timestamp: now()
+    )
+  elif res.text.len > 0:
+    printAssistantMessage(
+      agentName, res.text, theme, width,
+      ts = now(), showTs = state.settings.showTimestamp,
+      tokens = res.tokensUsed, elapsed = res.elapsed,
+      showStats = state.settings.showStats
+    )
+    state.history.add ReplMessage(
+      role: "assistant", name: agentName, text: res.text,
+      timestamp: now(), tokens: res.tokensUsed, elapsed: res.elapsed
+    )
+
+# =============================================================================
+# Config Display
+# =============================================================================
+
+proc printCfg*(cfg: AgentConfig, state: ReplState) =
+  ## Print current agent + REPL configuration.
+  let theme = state.settings.theme
+  let width = state.settings.getContentWidth()
+
+  proc kv(key, value: string) =
+    echo $styled("    " & key & ": ").fg(theme.metaText) &
+         $styled(value).fg(theme.userText)
+
+  echo ""
+  echo $styled("  Current configuration").fg(theme.headerAccent).style(bold, underline)
+  thinDivider(width, theme.dividerColor)
+
+  echo $styled("  Agent").fg(theme.assistantLabel).style(bold)
+  kv("name", cfg.name)
+  kv("id", cfg.id)
+  if cfg.role.len > 0: kv("role", cfg.role)
+  kv("model", cfg.model)
+  kv("workspaceDir", cfg.workspaceDir)
+  kv("dbPath", cfg.dbPath)
+  kv("enableReflection", $cfg.enableReflection)
+  if cfg.instructions.len > 0: kv("instructions", $cfg.instructions.len & " chars")
+  if cfg.systemPrompt.len > 0: kv("systemPrompt", $cfg.systemPrompt.len & " chars")
+
+  var toolNames: seq[string] = @[]
+  for k in cfg.tools.keys: toolNames.add k
+  toolNames.sort()
+  kv("tools", if toolNames.len > 0: toolNames.join(", ") else: "(none)")
+  kv("toolCount", $toolNames.len)
+  echo ""
+
+  echo $styled("  Policy").fg(theme.assistantLabel).style(bold)
+  kv("maxToolCalls", $cfg.policy.maxToolCalls)
+  kv("maxTokens", if cfg.policy.maxTokens > 0: $cfg.policy.maxTokens else: "(unset)")
+  kv("timeout", if cfg.policy.timeout > initDuration(seconds = 0): $cfg.policy.timeout else: "none")
+  kv("allowedTools", if cfg.policy.allowedTools.len > 0: cfg.policy.allowedTools.join(", ") else: "(all)")
+  kv("hitlEvery", $cfg.policy.hitlEvery)
+  kv("requireCheckpoints", $cfg.policy.requireCheckpoints)
+  echo ""
+
+  echo $styled("  Knowledge").fg(theme.assistantLabel).style(bold)
+  kv("chunkerKind", $cfg.knowledgeConfig.chunkerKind)
+  kv("maxChunkChars", $cfg.knowledgeConfig.maxChunkChars)
+  kv("chunkOverlap", $cfg.knowledgeConfig.chunkOverlap)
+  kv("embeddingModel", cfg.knowledgeConfig.embeddingModel)
+  kv("embeddingDim", $cfg.knowledgeConfig.embeddingDim)
+  kv("embeddingBatch", $cfg.knowledgeConfig.embeddingBatch)
+  kv("vectorExtPath", if cfg.knowledgeConfig.vectorExtPath.len > 0: cfg.knowledgeConfig.vectorExtPath else: "(default)")
+  kv("duplicateIngestPolicy", $cfg.knowledgeConfig.duplicateIngestPolicy)
+  kv("searchOversample", $cfg.knowledgeConfig.searchOversample)
+  echo ""
+
+  echo $styled("  REPL").fg(theme.assistantLabel).style(bold)
+  kv("showDebug", $state.settings.showDebug)
+  kv("showStats", $state.settings.showStats)
+  kv("showTimestamp", $state.settings.showTimestamp)
+  kv("wordWrap", $state.settings.wordWrap)
+  kv("maxWidth", $state.settings.maxWidth)
+  kv("loadHistory", $state.settings.loadHistory)
+  kv("maxHistoryLoad", $state.settings.maxHistoryLoad)
+
+  thinDivider(width, theme.dividerColor)
+  echo ""
+
+# =============================================================================
+# Command Processing (slash prefix)
+# =============================================================================
+
+proc processCommand*(cmd: string, state: var ReplState, agentName: string, agentStore: AgentStore = nil): bool =
+  ## Process a REPL slash command. Returns true if the command was handled.
+  let parts = cmd.split(" ", maxsplit = 1)
+  let command = parts[0].toLowerAscii()
+  let arg = if parts.len > 1: parts[1].strip() else: ""
+  let theme = state.settings.theme
+  let width = state.settings.getContentWidth()
+
+  case command
+  of "/help":
+    printHelp(theme, width)
+    return true
+
+  of "/paste":
+    return false  # Handled by caller
+
+  of "/clip":
+    return false  # Handled by caller
+
+  of "/sh":
+    state.lastExitCode = runShellCommand(arg, theme, interactive = false, lastExitCode = state.lastExitCode)
+    return true
+
+  of "/search":
+    searchHistory(state, arg, agentName, agentStore)
+    return true
+
+  of "/history":
+    let n = if arg.len > 0: (try: parseInt(arg) except: 5) else: 5
+    printHistory(state, n, agentName)
+    return true
+
+  of "/dbhistory":
+    let n = if arg.len > 0: (try: parseInt(arg) except: 20) else: 20
+    printDbHistory(agentStore, n, agentName, theme, width, state.settings.showStats)
+    return true
+
+  of "/save":
+    if arg.len == 0:
+      printError("Usage: /save <filepath>  or  /save db <filepath>", theme)
+    elif arg.startsWith("db "):
+      let dbPath = arg[3..^1].strip()
+      if dbPath.len == 0:
+        printError("Usage: /save db <filepath>", theme)
+      else:
+        try:
+          saveTranscriptFromDb(agentStore, dbPath, agentName)
+          printMeta(&"Full database transcript saved to {dbPath}", theme)
+        except:
+          printError(&"Failed to save: {getCurrentExceptionMsg()}", theme)
+    else:
+      try:
+        saveTranscript(state, arg, agentName)
+        printMeta(&"Transcript saved to {arg}", theme)
+      except:
+        printError(&"Failed to save: {getCurrentExceptionMsg()}", theme)
+    return true
+
+  of "/clear":
+    eraseScreen(stdout)
+    setCursorPos(stdout, 0, 0)
+    printHeader(agentName, theme, width)
+    return true
+
+  of "/debug":
+    state.settings.showDebug = not state.settings.showDebug
+    let status = if state.settings.showDebug: "ON" else: "OFF"
+    printMeta(&"Debug mode: {status}", theme)
+    return true
+
+  of "/stats":
+    state.settings.showStats = not state.settings.showStats
+    let status = if state.settings.showStats: "ON" else: "OFF"
+    printMeta(&"Stats display: {status}", theme)
+    return true
+
+  of "/timestamps":
+    state.settings.showTimestamp = not state.settings.showTimestamp
+    let status = if state.settings.showTimestamp: "ON" else: "OFF"
+    printMeta(&"Timestamps: {status}", theme)
+    return true
+
+  of "/wrap":
+    state.settings.wordWrap = not state.settings.wordWrap
+    let status = if state.settings.wordWrap: "ON" else: "OFF"
+    printMeta(&"Word wrap: {status}", theme)
+    return true
+
+  of "/width":
+    if arg.len == 0:
+      printMeta(&"Current width: {state.settings.getContentWidth()}", theme)
+    else:
+      state.settings.maxWidth = try: parseInt(arg) except: 0
+      printMeta(&"Max width set to: {state.settings.getContentWidth()}", theme)
+    return true
+
+  else:
+    # Handle /! shorthand — interactive mode (full terminal handover)
+    if command.startsWith("/!"):
+      let shCmd = if command == "/!": arg
+                  else: command[2..^1] & (if arg.len > 0: " " & arg else: "")
+      state.lastExitCode = runShellCommand(shCmd, theme, interactive = true, lastExitCode = state.lastExitCode)
+      return true
+
+    return false  # Not a recognized command
+
+# =============================================================================
+# Main Chat REPL (upgraded with SQLite support + slash commands)
+# =============================================================================
+
+proc chatRepl*(a: Agent, firstMsg: string = "", settings: ReplSettings = defaultSettings()) =
+  ## Opens a rich interactive chat REPL with the agent.
+  ##
+  ## Features:
+  ##   - SQLite-backed chat history (loads prior sessions, persists via chatTurn)
+  ##   - Styled message display with word wrapping
+  ##   - Tool call visibility (toggle with /debug)
+  ##   - Token/time stats (toggle with /stats)
+  ##   - Shell command execution (/sh or /!)
+  ##   - Chat history (/history / /dbhistory), transcript saving (/save / /save db)
+  ##   - Multi-line paste support (bracketed paste + /paste mode)
+  ##   - Animated thinking indicator
+  ##   - Customizable theme and settings
+
+  var state = initReplState()
+  state.settings = settings
+
+  let theme = state.settings.theme
+  let width = state.settings.getContentWidth()
+
+  # Grab the AgentStore handle for DB operations
+  let agentStore = a.state.agentStore
+
+  # Print header
+  printHeader(a.cfg.name, theme, width)
+
+  # Load prior chat history from SQLite if enabled
+  if state.settings.loadHistory and not agentStore.isNil:
+    state.loadHistoryFromDb(agentStore, a.cfg.name, theme, width)
+
+  replEnableBracketedPaste()
+  defer: replDisableBracketedPaste()
+
+  # Handle firstMsg if provided
+  if firstMsg.len > 0:
+    printUserMessage(firstMsg, theme, width, now(), state.settings.showTimestamp)
+    state.history.add ReplMessage(
+      role: "user", text: firstMsg, timestamp: now()
+    )
+
+    # chatTurn() persists user + assistant messages to SQLite
+    let fut = a.chatTurn(firstMsg)
+    let res = replWaitForTurn(a, fut, theme)
+    displayTickResult(res, a.cfg.name, state)
+
+  # Main loop
+  while state.running:
+    showPrompt(theme, state.lastExitCode)
+
+    var raw: string
+    try:
+      raw = readUserInput()
+    except EOFError:
+      echo ""
+      break
+
+    let cmd = raw.strip()
+    let low = cmd.toLowerAscii()
+
+    # Exit
+    if low in ["exit", "quit", "q"]:
+      echo ""
+      echo $styled("  👋 Session ended.").fg(theme.metaText)
+      if state.history.len > 0:
+        echo $styled(&"     {state.history.len} messages exchanged.").fg(theme.metaText).style(dim)
+      echo ""
+      break
+
+    # Empty input
+    if cmd.len == 0:
+      continue
+
+    # Slash commands
+    if cmd.startsWith("/"):
+      if low == "/cfg":
+        printCfg(a.cfg, state)
+        continue
+
+      if processCommand(cmd, state, a.cfg.name, agentStore):
+        continue
+
+      # Handle /paste specially
+      if low == "/paste":
+        echo $styled("  📋 Paste mode — end with /end").fg(theme.metaText).style(dim)
+        var lines: seq[string] = @[]
+        while true:
+          let line = stdin.readLine()
+          if line.strip() == "/end": break
+          lines.add line
+        raw = lines.join("\n")
+        if raw.strip().len == 0: continue
+
+      # Handle /clip
+      elif low == "/clip":
+        when defined(llmm_repl_clipboard):
+          raw = getClipboardText()
+        else:
+          printError("Clipboard not compiled. Rebuild with -d:llmm_repl_clipboard", theme)
+          continue
+
+      # Unknown slash command
+      else:
+        let parts = cmd.split(" ", maxsplit = 1)
+        printError(&"Unknown command: {parts[0]}. Type /help for available commands.", theme)
+        continue
+
+    let userMsg = raw.strip()
+    if userMsg.len == 0:
+      continue
+
+    # Display user message
+    printUserMessage(userMsg, theme, width, now(), state.settings.showTimestamp)
+    state.history.add ReplMessage(
+      role: "user", text: userMsg, timestamp: now()
+    )
+
+    # Execute chat turn — chatTurn() handles all SQLite persistence
+    let fut = a.chatTurn(userMsg)
+    let res = replWaitForTurn(a, fut, theme)
+    displayTickResult(res, a.cfg.name, state)
+
+
+proc feedback*(a: Agent, firstMsg: string = "") =
+  ## Opens a feedback-focused chat REPL with memory priority.
+  const feedbackPrefix = """
+## IMPORTANT: User Feedback Session
+
+The user is providing direct feedback. This information is HIGH PRIORITY and should be stored in memory.
+
+For EVERY piece of feedback the user shares:
+1. Acknowledge it
+2. Store it using the memory tool with source: "correction" or "user_preference" and kind: "fact" or "lesson" as appropriate
+3. Confirm what you stored
+
+Treat everything in this session as important context to remember for future interactions.
+"""
+
+  let originalPrompt = a.cfg.systemPrompt
+  a.cfg.systemPrompt = a.cfg.systemPrompt & "\n\n" & feedbackPrefix
+
+  var settings = defaultSettings()
+  settings.showStats = true
+  settings.showDebug = true  # Show memory tool calls during feedback
+
+  # Override the header briefly
+  echo ""
+  echo $styled("  📝 Feedback Session").fg(yellow).style(bold)
+  echo $styled("     Everything you say will be prioritized for memory storage.").fg(brightBlack).style(dim)
+  echo ""
+
+  chatRepl(a, firstMsg, settings)
+
+  a.cfg.systemPrompt = originalPrompt

@@ -1,717 +1,1399 @@
 # =============================================================================
-# chat_repl.nim - Stylish interactive chat REPL for llmm agents
+# chat_repl.nim – Fullscreen illwill TUI chat REPL for llmm agents
 # =============================================================================
 #
-# Replaces the chatRepl section of tick.nim with a rich terminal UI.
-# Uses nimsterm for styled output + std/terminal for dimensions.
+# A rich terminal interface built on illwill with:
+#   - Double-buffered fullscreen rendering (~30 FPS)
+#   - Scrollable chat history with word-wrapped messages
+#   - Inline text editor with cursor, multi-line compose mode
+#   - Animated thinking indicator during agent turns
+#   - Command palette (Ctrl+P) with fuzzy filtering
+#   - Mouse scroll on chat history
+#   - Tool-call debug overlay
+#   - Token/time stats footer
+#   - Transcript save, clipboard paste, history search
+#   - Fully themeable color scheme
+#   - SQLite-backed chat history (persisted via AgentStore)
 #
-# Compile flags:
-#   -d:llmm_repl_termui     Enable termui spinner (requires --threads:on)
-#   -d:llmm_repl_clipboard  Enable :clip command
-#   -d:llmm_repl_debug      Default debug mode ON
-#   -d:llmm_repl_stats      Default stats mode ON
+# Compile:
+#   nim c -r -d:ssl chat_repl.nim
 #
+# Flags:
+#   -d:llmm_repl_clipboard   Enable :clip / Ctrl+Shift+V
+#   -d:llmm_repl_debug       Default debug ON
+#   -d:llmm_repl_stats       Default stats ON
+#
+# NOTE: This file is `include`d from tick.nim, so all types from
+# agent.nim, sessions.nim, store.nim, tick.nim etc. are in scope.
 # =============================================================================
 
-import std/[
-json
-,times
-,options
-,asyncdispatch
-,strformat
-,strutils
-,sugar
-,tables
-,terminal
-,os
-,sequtils
-]
-
-import rz, ic
-import agent, sessions
-import ../tools/base
-import ../../general_helpers
-import ../../providers/oai/oai_client
-import ../../providers/oai/common/types
-import ../../providers/oai/utils/builders
-import ../../providers/oai/responses/types
-import ../../providers/oai/responses/api
-import ../../providers/oai/responses/utils
-
-import ./memory/types
-import ./memory/store
-import ./memory/tool
-import ./memory/integration
-
-# We import nimsterm for styled output
-import nimsterm
-
-when defined(llmm_repl_termui):
-  import termui
-
-
-# Re-export TickResult if not already visible from tick
-# (or just import tick and use its TickResult)
+import std/[strutils, strformat, sequtils, times, options, os, math, algorithm]
+import illwill
 
 # =============================================================================
-# REPL Configuration & State
+# Theme
+# =============================================================================
+
+type
+  TuiTheme* = object
+    headerBg*:        BackgroundColor
+    headerFg*:        ForegroundColor
+    footerBg*:        BackgroundColor
+    footerFg*:        ForegroundColor
+    borderFg*:        ForegroundColor
+    userLabel*:       ForegroundColor
+    userText*:        ForegroundColor
+    assistantLabel*:  ForegroundColor
+    assistantText*:   ForegroundColor
+    toolFg*:          ForegroundColor
+    errorFg*:         ForegroundColor
+    metaFg*:          ForegroundColor
+    statFg*:          ForegroundColor
+    inputFg*:         ForegroundColor
+    inputActiveBg*:   BackgroundColor
+    paletteBorderFg*: ForegroundColor
+    paletteFg*:       ForegroundColor
+    paletteSelBg*:    BackgroundColor
+
+proc defaultTheme*(): TuiTheme =
+  TuiTheme(
+    headerBg:        bgBlue,
+    headerFg:        fgWhite,
+    footerBg:        bgBlack,
+    footerFg:        fgWhite,
+    borderFg:        fgCyan,
+    userLabel:       fgCyan,
+    userText:        fgWhite,
+    assistantLabel:  fgGreen,
+    assistantText:   fgWhite,
+    toolFg:          fgYellow,
+    errorFg:         fgRed,
+    metaFg:          fgBlack,       # bright-black = grey
+    statFg:          fgBlack,
+    inputFg:         fgWhite,
+    inputActiveBg:   bgNone,
+    paletteBorderFg: fgMagenta,
+    paletteFg:       fgWhite,
+    paletteSelBg:    bgMagenta,
+  )
+
+# =============================================================================
+# Settings
 # =============================================================================
 
 type
   ReplSettings* = object
-    showDebug*     : bool   ## Show tool calls and internal events
-    showStats*     : bool   ## Show token/time footer after each response
-    showTimestamp* : bool   ## Show timestamps on messages
-    wordWrap*      : bool   ## Word-wrap output to terminal width
-    maxWidth*      : int    ## Max content width (0 = auto from terminal)
-    theme*         : ReplTheme
-
-  ReplTheme* = object
-    ## Color scheme for the REPL. All fields are nimsterm Color values.
-    userLabel*      : Color
-    userText*       : Color
-    assistantLabel* : Color
-    assistantText*  : Color
-    toolLabel*      : Color
-    toolText*       : Color
-    errorLabel*     : Color
-    errorText*      : Color
-    metaText*       : Color
-    statText*       : Color
-    headerAccent*   : Color
-    dividerColor*   : Color
-    promptArrow*    : Color
-
-  ReplMessage* = object
-    role*      : string   # "user" | "assistant" | "tool" | "error" | "meta"
-    name*      : string
-    text*      : string
-    timestamp* : DateTime
-    tokens*    : int
-    elapsed*   : Duration
-
-  ReplState* = object
-    settings*  : ReplSettings
-    history*   : seq[ReplMessage]
-    running*   : bool
-
-# =============================================================================
-# Default Theme - Clean dark terminal aesthetic
-# =============================================================================
-
-proc defaultTheme*(): ReplTheme =
-  ReplTheme(
-    userLabel      : cyan
-    ,userText      : white
-    ,assistantLabel : green
-    ,assistantText  : white
-    ,toolLabel      : yellow
-    ,toolText       : brightBlack
-    ,errorLabel     : red
-    ,errorText      : red
-    ,metaText       : brightBlack
-    ,statText       : brightBlack
-    ,headerAccent   : cyan
-    ,dividerColor   : brightBlack
-    ,promptArrow    : cyan
-  )
+    showDebug*:     bool
+    showStats*:     bool
+    showTimestamps*: bool
+    wordWrap*:      bool
+    theme*:         TuiTheme
+    loadHistory*:   bool          ## Load prior chat history from SQLite on startup
+    maxHistoryLoad*: int          ## Max number of prior messages to load (0 = all)
 
 proc defaultSettings*(): ReplSettings =
   ReplSettings(
-    showDebug     : defined(llmm_repl_debug)
-    ,showStats    : defined(llmm_repl_stats) or true
-    ,showTimestamp : false
-    ,wordWrap     : true
-    ,maxWidth     : 0
-    ,theme        : defaultTheme()
-  )
-
-proc initReplState*(): ReplState =
-  ReplState(
-    settings : defaultSettings()
-    ,history : @[]
-    ,running : true
+    showDebug:     defined(llmm_repl_debug),
+    showStats:     true,
+    showTimestamps: false,
+    wordWrap:      true,
+    theme:         defaultTheme(),
+    loadHistory:   true,
+    maxHistoryLoad: 100,
   )
 
 # =============================================================================
-# Terminal Helpers
+# Chat message model
 # =============================================================================
 
-proc getContentWidth(s: ReplSettings): int =
-  ## Returns the content width to use for wrapping.
-  if s.maxWidth > 0: return s.maxWidth
-  let tw = terminalWidth()
-  if tw > 10: tw - 4  # Leave some margin
-  else: 76             # Safe fallback
+type
+  ChatRole* = enum
+    crUser, crAssistant, crTool, crError, crMeta
 
-proc wrapText*(text: string, width: int, indent: int = 0): string =
-  ## Word-wrap text to given width with optional indent.
-  ## Respects existing newlines.
-  let indentStr = " ".repeat(indent)
-  let effectiveWidth = width - indent
-  if effectiveWidth <= 10: return text
-
-  var lines: seq[string] = @[]
-  for paragraph in text.split('\n'):
-    if paragraph.strip().len == 0:
-      lines.add ""
-      continue
-
-    var currentLine = ""
-    for word in paragraph.splitWhitespace():
-      if currentLine.len == 0:
-        currentLine = word
-      elif currentLine.len + 1 + word.len <= effectiveWidth:
-        currentLine &= " " & word
-      else:
-        lines.add(indentStr & currentLine)
-        currentLine = word
-
-    if currentLine.len > 0:
-      lines.add(indentStr & currentLine)
-
-  result = lines.join("\n")
-
-proc thinDivider(width: int, color: Color = brightBlack) =
-  echo $styled("─".repeat(width)).fg(color).style(dim)
-
-proc thickDivider(width: int, color: Color = brightBlack) =
-  echo $styled("━".repeat(width)).fg(color)
+  ChatMessage* = object
+    role*:      ChatRole
+    name*:      string
+    text*:      string
+    timestamp*: DateTime
+    tokens*:    int
+    elapsed*:   Duration
 
 # =============================================================================
-# Formatted Message Printing
+# Rendered line – a chat message gets word-wrapped into these
 # =============================================================================
 
-proc printHeader*(agentName: string, theme: ReplTheme, width: int) =
-  ## Print the chat session header.
-  echo ""
-  let topBar = "╭" & "─".repeat(width - 2) & "╮"
-  let botBar = "╰" & "─".repeat(width - 2) & "╯"
-
-  echo $styled(topBar).fg(theme.headerAccent).style(dim)
-
-  let title = &"  💬  Chat with {agentName}"
-  let padding = max(0, width - 2 - title.len)
-  echo $styled("│").fg(theme.headerAccent).style(dim) &
-       $styled(title).fg(theme.headerAccent).style(bold) &
-       " ".repeat(padding) &
-       $styled("│").fg(theme.headerAccent).style(dim)
-
-  echo $styled(botBar).fg(theme.headerAccent).style(dim)
-  echo ""
-
-  # Quick help line
-  echo $styled("  Type ").fg(theme.metaText) &
-       $styled(":help").fg(cyan).style(bold) &
-       $styled(" for commands  •  ").fg(theme.metaText) &
-       $styled("exit").fg(cyan).style(bold) &
-       $styled(" to quit  •  ").fg(theme.metaText) &
-       $styled("paste multi-line directly").fg(theme.metaText)
-  echo ""
-
-proc printUserMessage*(msg: string, theme: ReplTheme, width: int, ts: DateTime, showTs: bool) =
-  ## Print a user message in styled format.
-  let tsStr = if showTs: $styled(" " & ts.format("HH:mm")).fg(theme.metaText).style(dim) else: ""
-
-  echo $styled("  You ").fg(theme.userLabel).style(bold) & tsStr
-  let wrapped = wrapText(msg, width, indent = 4)
-  for line in wrapped.split('\n'):
-    echo $styled(line).fg(theme.userText)
-  echo ""
-
-proc printAssistantMessage*(name, msg: string, theme: ReplTheme, width: int,
-                            ts: DateTime, showTs: bool, tokens: int, elapsed: Duration,
-                            showStats: bool) =
-  ## Print an assistant message in styled format.
-  let tsStr = if showTs: $styled(" " & ts.format("HH:mm")).fg(theme.metaText).style(dim) else: ""
-
-  echo $styled(&"  {name} ").fg(theme.assistantLabel).style(bold) & tsStr
-  let wrapped = wrapText(msg, width, indent = 4)
-  for line in wrapped.split('\n'):
-    echo $styled(line).fg(theme.assistantText)
-
-  if showStats and (tokens > 0 or elapsed > DurationZero):
-    let elapsedMs = elapsed.inMilliseconds
-    let statsLine = &"    ⏱ {elapsedMs}ms  •  📊 {tokens} tokens"
-    echo $styled(statsLine).fg(theme.statText).style(dim)
-
-  echo ""
-
-proc printToolCall*(toolName, args: string, theme: ReplTheme) =
-  ## Print a tool call event (debug mode).
-  echo $styled("    ⚡ ").fg(theme.toolLabel) &
-       $styled(toolName).fg(theme.toolLabel).style(bold) &
-       $styled("(").fg(theme.toolText) &
-       $styled(args.substr(0, min(args.len - 1, 80))).fg(theme.toolText).style(dim) &
-       $styled(if args.len > 80: "…)" else: ")").fg(theme.toolText)
-
-proc printToolResult*(toolId: string, ok: bool, output: string, theme: ReplTheme) =
-  ## Print a tool result event (debug mode).
-  let icon   = if ok: "✓" else: "✗"
-  let color  = if ok: nimsterm.green else: nimsterm.red  
-  let preview = output.substr(0, min(output.len - 1, 60)).replace("\n", " ")
-  echo $styled(&"    {icon} ").fg(color) &
-       $styled(preview).fg(theme.toolText).style(dim) &
-       (if output.len > 60: $styled("…").fg(theme.toolText) else: "")
-
-proc printError*(msg: string, theme: ReplTheme) =
-  ## Print an error message.
-  echo $styled("  ✗ Error: ").fg(theme.errorLabel).style(bold) &
-       $styled(msg).fg(theme.errorText)
-  echo ""
-
-proc printMeta*(msg: string, theme: ReplTheme) =
-  ## Print a meta/system message.
-  echo $styled(&"  ℹ {msg}").fg(theme.metaText).style(dim)
-  echo ""
+type
+  RenderedLine = object
+    text: string
+    fg:   ForegroundColor
+    bright: bool
+    bg:   BackgroundColor
+    # If this is the first line of a message, it carries the label
+    isLabel: bool
 
 # =============================================================================
-# Help Screen
+# Command palette
 # =============================================================================
 
-proc printHelp*(theme: ReplTheme, width: int) =
-  echo ""
-  echo $styled("  Commands").fg(theme.headerAccent).style(bold, underline)
-  echo ""
+type
+  PaletteCommand = object
+    id:    string
+    title: string
+    hint:  string
+    key:   string   # display shortcut
 
-  let cmds = @[
-    (":help",          "Show this help"),
-    (":paste",         "Enter paste mode (end with :end)"),
-    (":clip",          "Send clipboard as message"),
-    (":history [n]",   "Show last n exchanges (default 5)"),
-    (":save <path>",   "Save transcript to file"),
-    (":clear",         "Clear screen and reprint header"),
-    (":debug",         "Toggle tool-call visibility"),
-    (":stats",         "Toggle token/time stats"),
-    (":timestamps",    "Toggle timestamps"),
-    (":wrap",          "Toggle word wrapping"),
-    (":width <n>",     "Set max content width (0=auto)"),
-    ("exit / quit / q", "End session"),
+proc allCommands(): seq[PaletteCommand] =
+  @[
+    PaletteCommand(id: "debug",      title: "Toggle debug (tool calls)",  hint: "Show/hide tool invocations",  key: "Ctrl+D"),
+    PaletteCommand(id: "stats",      title: "Toggle stats",              hint: "Token count / latency footer", key: "Ctrl+T"),
+    PaletteCommand(id: "timestamps", title: "Toggle timestamps",         hint: "Show HH:MM on messages",       key: ""),
+    PaletteCommand(id: "wrap",       title: "Toggle word wrap",          hint: "Wrap long lines",              key: ""),
+    PaletteCommand(id: "clear",      title: "Clear chat history",        hint: "Erase all messages",           key: "Ctrl+L"),
+    PaletteCommand(id: "save",       title: "Save transcript",           hint: "Save as Markdown",             key: "Ctrl+S"),
+    PaletteCommand(id: "paste",      title: "Compose multi-line",        hint: "Enter compose mode",           key: "Ctrl+O"),
+    PaletteCommand(id: "help",       title: "Show help overlay",         hint: "Keyboard shortcuts",           key: "?"),
+    PaletteCommand(id: "quit",       title: "Quit",                      hint: "End session",                  key: "Ctrl+Q"),
   ]
 
-  for (cmd, desc) in cmds:
-    let padded = cmd & " ".repeat(max(1, 20 - cmd.len))
-    echo $styled("    ").fg(theme.metaText) &
-         $styled(padded).fg(cyan).style(bold) &
-         $styled(desc).fg(theme.metaText)
-
-  echo ""
+proc filterCommands(q: string): seq[PaletteCommand] =
+  if q.strip().len == 0: return allCommands()
+  let low = q.toLowerAscii()
+  allCommands().filterIt(
+    it.title.toLowerAscii().contains(low) or
+    it.hint.toLowerAscii().contains(low)
+  )
 
 # =============================================================================
-# History & Transcript
+# Application state
 # =============================================================================
 
-proc printHistory*(state: ReplState, n: int, agentName: string) =
+type
+  InputMode = enum
+    imNormal,    # single-line typing
+    imCompose,   # multi-line compose (Ctrl+O)
+
+  OverlayKind = enum
+    okNone, okHelp, okPalette, okSavePrompt
+
+  AppState = object
+    running:       bool
+    settings:      ReplSettings
+    agentName:     string
+
+    # Chat
+    messages:      seq[ChatMessage]
+    rendered:      seq[RenderedLine]   # flattened, word-wrapped lines
+    chatScroll:    int                 # offset from bottom (0 = latest)
+
+    # Input
+    inputBuf:      string
+    inputCursor:   int
+    inputMode:     InputMode
+    composeLines:  seq[string]         # lines accumulated in compose mode
+
+    # Thinking
+    thinking:      bool
+    thinkFrame:    int
+
+    # Overlays
+    overlay:       OverlayKind
+    paletteQuery:  string
+    paletteIdx:    int
+    savePathBuf:   string
+
+    # Status toast
+    toastMsg:      string
+    toastUntil:    float
+
+    # Search
+    searchMode:    bool
+    searchQuery:   string
+    searchHits:    seq[int]            # indices into `messages`
+    searchIdx:     int
+
+# =============================================================================
+# Helpers
+# =============================================================================
+
+proc clampI(x, lo, hi: int): int = max(lo, min(hi, x))
+
+proc padRight(s: string, n: int): string =
+  if s.len >= n: return s[0 ..< n]
+  s & ' '.repeat(n - s.len)
+
+proc centerIn(s: string, n: int): string =
+  if n <= 0: return ""
+  if s.len >= n: return s[0 ..< n]
+  let left = (n - s.len) div 2
+  ' '.repeat(left) & s & ' '.repeat(n - s.len - left)
+
+proc setToast(state: var AppState, msg: string, secs = 2.0) =
+  state.toastMsg = msg
+  state.toastUntil = epochTime() + secs
+
+proc toastActive(state: AppState): bool =
+  state.toastMsg.len > 0 and epochTime() < state.toastUntil
+
+proc keyToChar(k: Key): Option[char] =
+  ## Map an illwill Key to a printable char (ASCII subset).
+  let v = ord(k)
+  if v >= 32 and v <= 126:
+    return some(chr(v))
+  # Shifted letters
+  case k
+  of Key.ShiftA: return some('A')
+  of Key.ShiftB: return some('B')
+  of Key.ShiftC: return some('C')
+  of Key.ShiftD: return some('D')
+  of Key.ShiftE: return some('E')
+  of Key.ShiftF: return some('F')
+  of Key.ShiftG: return some('G')
+  of Key.ShiftH: return some('H')
+  of Key.ShiftI: return some('I')
+  of Key.ShiftJ: return some('J')
+  of Key.ShiftK: return some('K')
+  of Key.ShiftL: return some('L')
+  of Key.ShiftM: return some('M')
+  of Key.ShiftN: return some('N')
+  of Key.ShiftO: return some('O')
+  of Key.ShiftP: return some('P')
+  of Key.ShiftQ: return some('Q')
+  of Key.ShiftR: return some('R')
+  of Key.ShiftS: return some('S')
+  of Key.ShiftT: return some('T')
+  of Key.ShiftU: return some('U')
+  of Key.ShiftV: return some('V')
+  of Key.ShiftW: return some('W')
+  of Key.ShiftX: return some('X')
+  of Key.ShiftY: return some('Y')
+  of Key.ShiftZ: return some('Z')
+  else: discard
+  # Common punctuation that illwill maps to named keys
+  case k
+  of Key.Space:          return some(' ')
+  of Key.Comma:          return some(',')
+  of Key.Dot:            return some('.')
+  of Key.Slash:          return some('/')
+  of Key.Backslash:      return some('\\')
+  of Key.Minus:          return some('-')
+  of Key.Underscore:     return some('_')
+  of Key.Equals:         return some('=')
+  of Key.Semicolon:      return some(';')
+  of Key.Colon:          return some(':')
+  of Key.SingleQuote:    return some('\'')
+  of Key.DoubleQuote:    return some('"')
+  of Key.LeftParen:      return some('(')
+  of Key.RightParen:     return some(')')
+  of Key.LeftBracket:    return some('[')
+  of Key.RightBracket:   return some(']')
+  of Key.LeftBrace:      return some('{')
+  of Key.RightBrace:     return some('}')
+  of Key.Asterisk:       return some('*')
+  of Key.Plus:           return some('+')
+  of Key.QuestionMark:   return some('?')
+  of Key.ExclamationMark: return some('!')
+  of Key.Hash:           return some('#')
+  of Key.Dollar:         return some('$')
+  of Key.Percent:        return some('%')
+  of Key.Ampersand:      return some('&')
+  of Key.At:             return some('@')
+  of Key.Caret:          return some('^')
+  of Key.GraveAccent:    return some('`')
+  of Key.Tilde:          return some('~')
+  of Key.LessThan:       return some('<')
+  of Key.GreaterThan:    return some('>')
+  of Key.Pipe:           return some('|')
+  of Key.Zero:           return some('0')
+  of Key.One:            return some('1')
+  of Key.Two:            return some('2')
+  of Key.Three:          return some('3')
+  of Key.Four:           return some('4')
+  of Key.Five:           return some('5')
+  of Key.Six:            return some('6')
+  of Key.Seven:          return some('7')
+  of Key.Eight:          return some('8')
+  of Key.Nine:           return some('9')
+  else: discard
+  return none(char)
+
+# =============================================================================
+# Word wrapping
+# =============================================================================
+
+proc wrapLines(text: string, width: int): seq[string] =
+  ## Word-wrap text to `width`, preserving existing newlines.
+  if width <= 0: return @[text]
+  for para in text.split('\n'):
+    if para.strip().len == 0:
+      result.add("")
+      continue
+    var cur = ""
+    for word in para.splitWhitespace():
+      if cur.len == 0:
+        cur = word
+      elif cur.len + 1 + word.len <= width:
+        cur &= " " & word
+      else:
+        result.add(cur)
+        cur = word
+    if cur.len > 0:
+      result.add(cur)
+
+# =============================================================================
+# Render chat messages into RenderedLine seq
+# =============================================================================
+
+proc rebuildRendered(state: var AppState) =
+  ## Flatten all messages into wrapped RenderedLine entries.
   let theme = state.settings.theme
-  let width = state.settings.getContentWidth()
-  let count = min(n, state.history.len)
-  if count == 0:
-    printMeta("No messages in history yet.", theme)
-    return
+  let w = terminalWidth() - 6  # leave 3-char margin each side
+  let wrapW = if state.settings.wordWrap: max(20, w) else: 9999
 
-  printMeta(&"Last {count} messages:", theme)
-  thinDivider(width, theme.dividerColor)
+  state.rendered.setLen(0)
 
-  for i in (state.history.len - count) ..< state.history.len:
-    let msg = state.history[i]
+  for msg in state.messages:
+    let ts = if state.settings.showTimestamps: msg.timestamp.format(" HH:mm") else: ""
+
     case msg.role
-    of "user":
-      printUserMessage(msg.text, theme, width, msg.timestamp, showTs = true)
-    of "assistant":
-      printAssistantMessage(msg.name, msg.text, theme, width, msg.timestamp,
-                            showTs = true, tokens = msg.tokens,
-                            elapsed = msg.elapsed, showStats = state.settings.showStats)
-    of "error":
-      printError(msg.text, theme)
+    of crUser:
+      # Label line
+      state.rendered.add RenderedLine(
+        text: "You" & ts,
+        fg: theme.userLabel, bright: true, bg: bgNone, isLabel: true,
+      )
+      for line in wrapLines(msg.text, wrapW):
+        state.rendered.add RenderedLine(
+          text: "  " & line,
+          fg: theme.userText, bright: false, bg: bgNone,
+        )
+      state.rendered.add RenderedLine(text: "", fg: fgNone, bright: false, bg: bgNone)
+
+    of crAssistant:
+      let label = msg.name & ts
+      state.rendered.add RenderedLine(
+        text: label,
+        fg: theme.assistantLabel, bright: true, bg: bgNone, isLabel: true,
+      )
+      for line in wrapLines(msg.text, wrapW):
+        state.rendered.add RenderedLine(
+          text: "  " & line,
+          fg: theme.assistantText, bright: false, bg: bgNone,
+        )
+      # Stats line
+      if state.settings.showStats and (msg.tokens > 0 or msg.elapsed > DurationZero):
+        let ms = msg.elapsed.inMilliseconds
+        state.rendered.add RenderedLine(
+          text: &"  {ms}ms | {msg.tokens} tok",
+          fg: theme.statFg, bright: true, bg: bgNone,
+        )
+      state.rendered.add RenderedLine(text: "", fg: fgNone, bright: false, bg: bgNone)
+
+    of crTool:
+      if state.settings.showDebug:
+        state.rendered.add RenderedLine(
+          text: "  > " & msg.text,
+          fg: theme.toolFg, bright: false, bg: bgNone,
+        )
+
+    of crError:
+      state.rendered.add RenderedLine(
+        text: "ERROR: " & msg.text,
+        fg: theme.errorFg, bright: true, bg: bgNone,
+      )
+      state.rendered.add RenderedLine(text: "", fg: fgNone, bright: false, bg: bgNone)
+
+    of crMeta:
+      state.rendered.add RenderedLine(
+        text: "  " & msg.text,
+        fg: theme.metaFg, bright: true, bg: bgNone,
+      )
+      state.rendered.add RenderedLine(text: "", fg: fgNone, bright: false, bg: bgNone)
+
+# =============================================================================
+# Layout rects
+# =============================================================================
+
+type
+  Rect = object
+    x1, y1, x2, y2: int
+
+proc w(r: Rect): int = max(0, r.x2 - r.x1 + 1)
+proc h(r: Rect): int = max(0, r.y2 - r.y1 + 1)
+
+proc inset(r: Rect, dx, dy: int): Rect =
+  Rect(x1: r.x1+dx, y1: r.y1+dy, x2: r.x2-dx, y2: r.y2-dy)
+
+# =============================================================================
+# Drawing helpers
+# =============================================================================
+
+proc fillRect(tb: var TerminalBuffer, r: Rect, ch = " ") =
+  for y in r.y1 .. r.y2:
+    for x in r.x1 .. r.x2:
+      tb.write(x, y, ch)
+
+proc writeClipped(tb: var TerminalBuffer, x, y: int, s: string, maxW: int) =
+  if maxW <= 0: return
+  let t = if s.len > maxW: s[0 ..< maxW] else: s
+  tb.write(x, y, t)
+
+# =============================================================================
+# Draw: header
+# =============================================================================
+
+proc drawHeader(tb: var TerminalBuffer, r: Rect, state: AppState) =
+  let theme = state.settings.theme
+  tb.setBackgroundColor(theme.headerBg)
+  tb.setForegroundColor(theme.headerFg, bright = true)
+  tb.fill(r.x1, r.y1, r.x2, r.y2, " ")
+
+  let title = &" Chat: {state.agentName} "
+  tb.write(r.x1 + 1, r.y1, title)
+
+  let clock = now().format("HH:mm:ss")
+  tb.write(r.x2 - clock.len - 1, r.y1, clock)
+
+  # Mode indicator
+  let mode = case state.inputMode
+    of imNormal:  ""
+    of imCompose: " [COMPOSE] "
+  if mode.len > 0:
+    tb.setForegroundColor(fgYellow, bright = true)
+    tb.write(r.x1 + title.len + 2, r.y1, mode)
+
+  if state.searchMode:
+    tb.setForegroundColor(fgYellow, bright = true)
+    tb.write(r.x1 + title.len + mode.len + 2, r.y1, " [SEARCH] ")
+
+  tb.resetAttributes()
+
+# =============================================================================
+# Draw: footer / status bar
+# =============================================================================
+
+proc drawFooter(tb: var TerminalBuffer, r: Rect, state: AppState) =
+  let theme = state.settings.theme
+  tb.setBackgroundColor(theme.footerBg)
+  tb.setForegroundColor(theme.footerFg)
+  tb.fill(r.x1, r.y1, r.x2, r.y2, " ")
+
+  let hints = " Ctrl+P:Palette  Ctrl+O:Compose  Ctrl+S:Save  ?:Help  Ctrl+Q:Quit "
+  tb.setForegroundColor(fgCyan, bright = true)
+  tb.writeClipped(r.x1 + 1, r.y1, hints, w(r) - 2)
+
+  # Toast
+  if toastActive(state):
+    tb.setBackgroundColor(bgYellow)
+    tb.setForegroundColor(fgBlack, bright = true)
+    let msg = " " & state.toastMsg & " "
+    let x = clampI(r.x2 - msg.len - 1, r.x1 + 1, r.x2 - 1)
+    tb.write(x, r.y1, msg)
+
+  tb.resetAttributes()
+
+# =============================================================================
+# Draw: chat area (scrollable)
+# =============================================================================
+
+proc drawChatArea(tb: var TerminalBuffer, r: Rect, state: AppState) =
+  let theme = state.settings.theme
+  let inner = inset(r, 1, 0)
+  let visibleH = h(inner)
+  if visibleH <= 0: return
+
+  let totalLines = state.rendered.len
+  let maxScroll = max(0, totalLines - visibleH)
+  let scroll = clampI(state.chatScroll, 0, maxScroll)
+
+  # We display from bottom: the newest content is at the bottom of the view
+  let startLine = max(0, totalLines - visibleH - scroll)
+  let endLine = min(totalLines, startLine + visibleH)
+
+  var y = inner.y1
+  for i in startLine ..< endLine:
+    let rl = state.rendered[i]
+    tb.setForegroundColor(rl.fg, bright = rl.bright)
+    if rl.bg != bgNone:
+      tb.setBackgroundColor(rl.bg)
+    tb.writeClipped(inner.x1, y, rl.text, w(inner))
+    tb.resetAttributes()
+    inc y
+
+  # Scroll indicator on right edge
+  if totalLines > visibleH:
+    let barH = max(1, (visibleH * visibleH) div totalLines)
+    let barPos = if maxScroll > 0:
+      ((maxScroll - scroll) * (visibleH - barH)) div maxScroll
+    else: 0
+
+    for sy in 0 ..< visibleH:
+      let ch = if sy >= barPos and sy < barPos + barH: "█" else: "│"
+      tb.setForegroundColor(fgBlack, bright = true)
+      tb.write(r.x2, r.y1 + sy, ch)
+
+  # Thinking indicator
+  if state.thinking:
+    let spinChars = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+    let frame = state.thinkFrame mod spinChars.len
+    let thinkY = min(inner.y2, inner.y1 + endLine - startLine)
+    tb.setForegroundColor(theme.assistantLabel, bright = true)
+    tb.write(inner.x1, thinkY, spinChars[frame] & " " & state.agentName & " is thinking...")
+
+  tb.resetAttributes()
+
+# =============================================================================
+# Draw: input area
+# =============================================================================
+
+proc drawInputArea(tb: var TerminalBuffer, r: Rect, state: AppState) =
+  let theme = state.settings.theme
+  let inner = inset(r, 1, 0)
+
+  # Border line above input
+  tb.setForegroundColor(theme.borderFg)
+  tb.drawHorizLine(r.x1, r.x2, r.y1)
+
+  case state.inputMode
+  of imNormal:
+    # Prompt symbol
+    tb.setForegroundColor(theme.userLabel, bright = true)
+    tb.write(inner.x1, inner.y1 + 1, "> ")
+
+    # Input text with cursor
+    let inputW = w(inner) - 3
+    let displayStart = max(0, state.inputCursor - inputW + 1)
+    let visible = state.inputBuf[displayStart ..< min(state.inputBuf.len, displayStart + inputW)]
+
+    tb.setForegroundColor(theme.inputFg)
+    tb.write(inner.x1 + 2, inner.y1 + 1, padRight(visible, inputW))
+
+    # Cursor (block highlight)
+    let cursorScreenX = inner.x1 + 2 + (state.inputCursor - displayStart)
+    if cursorScreenX <= inner.x2:
+      let ch = if state.inputCursor < state.inputBuf.len:
+        $state.inputBuf[state.inputCursor]
+      else: " "
+      tb.setBackgroundColor(bgWhite)
+      tb.setForegroundColor(fgBlack)
+      tb.write(cursorScreenX, inner.y1 + 1, ch)
+
+  of imCompose:
+    tb.setForegroundColor(fgYellow, bright = true)
+    tb.write(inner.x1, inner.y1 + 1, "COMPOSE (Ctrl+Enter to send, Esc to cancel)")
+
+    # Show last few compose lines
+    let availH = h(inner) - 2
+    let startIdx = max(0, state.composeLines.len - availH)
+    var cy = inner.y1 + 2
+    for i in startIdx ..< state.composeLines.len:
+      tb.setForegroundColor(theme.inputFg)
+      tb.writeClipped(inner.x1 + 2, cy, state.composeLines[i], w(inner) - 3)
+      inc cy
+
+    # Current line being typed
+    if cy <= inner.y2:
+      tb.setForegroundColor(theme.inputFg)
+      tb.write(inner.x1, cy, "> ")
+      tb.writeClipped(inner.x1 + 2, cy, state.inputBuf, w(inner) - 3)
+
+  tb.resetAttributes()
+
+# =============================================================================
+# Draw: help overlay
+# =============================================================================
+
+proc drawHelpOverlay(tb: var TerminalBuffer, root: Rect) =
+  let ww = min(72, w(root) - 4)
+  let hh = min(22, h(root) - 4)
+  if ww < 30 or hh < 10: return
+
+  let x1 = root.x1 + (w(root) - ww) div 2
+  let y1 = root.y1 + (h(root) - hh) div 2
+  let box = Rect(x1: x1, y1: y1, x2: x1 + ww - 1, y2: y1 + hh - 1)
+
+  # Background
+  tb.setBackgroundColor(bgBlack)
+  tb.setForegroundColor(fgWhite)
+  tb.fill(box.x1, box.y1, box.x2, box.y2, " ")
+
+  # Border
+  var bb = newBoxBuffer(tb.width, tb.height)
+  bb.drawRect(box.x1, box.y1, box.x2, box.y2, doubleStyle = true)
+  tb.setForegroundColor(fgCyan, bright = true)
+  tb.write(bb)
+  tb.resetAttributes()
+
+  let inner = inset(box, 2, 1)
+  var y = inner.y1
+  tb.setForegroundColor(fgWhite, bright = true)
+  tb.write(inner.x1, y, "Keyboard Shortcuts  (? or Esc to close)")
+  y += 2
+
+  let shortcuts = @[
+    ("Enter",         "Send message"),
+    ("Ctrl+O",        "Compose multi-line (Ctrl+Enter to send)"),
+    ("Ctrl+P",        "Command palette"),
+    ("Ctrl+S",        "Save transcript"),
+    ("Ctrl+D",        "Toggle debug (tool calls)"),
+    ("Ctrl+T",        "Toggle stats"),
+    ("Ctrl+L",        "Clear chat"),
+    ("Ctrl+F",        "Search messages"),
+    ("Ctrl+Q / Esc",  "Quit (Esc also closes overlays)"),
+    ("Up/Down",       "Input history (TODO)"),
+    ("PgUp/PgDn",     "Scroll chat history"),
+    ("Mouse Scroll",  "Scroll chat history"),
+    ("Home/End",      "Cursor to start/end of input"),
+    ("?",             "This help screen"),
+  ]
+
+  tb.setForegroundColor(fgWhite)
+  for (key, desc) in shortcuts:
+    if y > inner.y2: break
+    tb.setForegroundColor(fgYellow, bright = true)
+    tb.writeClipped(inner.x1, y, padRight(key, 18), 18)
+    tb.setForegroundColor(fgWhite)
+    tb.writeClipped(inner.x1 + 18, y, desc, w(inner) - 18)
+    y += 1
+
+  tb.resetAttributes()
+
+# =============================================================================
+# Draw: command palette
+# =============================================================================
+
+proc drawPalette(tb: var TerminalBuffer, root: Rect, state: AppState) =
+  let ww = min(70, w(root) - 6)
+  let hh = min(16, h(root) - 6)
+  if ww < 30 or hh < 8: return
+
+  let x1 = root.x1 + (w(root) - ww) div 2
+  let y1 = root.y1 + (h(root) - hh) div 3
+  let box = Rect(x1: x1, y1: y1, x2: x1 + ww - 1, y2: y1 + hh - 1)
+
+  tb.setBackgroundColor(bgBlack)
+  tb.setForegroundColor(fgWhite)
+  tb.fill(box.x1, box.y1, box.x2, box.y2, " ")
+
+  var bb = newBoxBuffer(tb.width, tb.height)
+  bb.drawRect(box.x1, box.y1, box.x2, box.y2, doubleStyle = true)
+  tb.setForegroundColor(fgMagenta, bright = true)
+  tb.write(bb)
+  tb.resetAttributes()
+
+  let inner = inset(box, 2, 1)
+  let cmds = filterCommands(state.paletteQuery)
+  let idxMax = max(0, cmds.len - 1)
+  let idx = clampI(state.paletteIdx, 0, idxMax)
+
+  tb.setForegroundColor(fgWhite, bright = true)
+  tb.write(inner.x1, inner.y1, "Command Palette  (Esc to close, Enter to run)")
+
+  tb.setForegroundColor(fgCyan)
+  tb.write(inner.x1, inner.y1 + 1, "> " & state.paletteQuery & "_")
+
+  let listY1 = inner.y1 + 3
+  let visible = max(0, inner.y2 - listY1 + 1)
+
+  for i in 0 ..< visible:
+    let y = listY1 + i
+    if i < cmds.len:
+      let isSel = (i == idx)
+      if isSel:
+        tb.setBackgroundColor(bgMagenta)
+        tb.setForegroundColor(fgWhite, bright = true)
+      else:
+        tb.setBackgroundColor(bgNone)
+        tb.setForegroundColor(fgWhite)
+
+      let left = padRight(cmds[i].title, max(0, w(inner) - 14))
+      let right = padRight(cmds[i].key, 12)
+      tb.writeClipped(inner.x1, y, left & right, w(inner))
+      tb.resetAttributes()
     else:
-      printMeta(msg.text, theme)
+      tb.write(inner.x1, y, ' '.repeat(w(inner)))
 
-  thinDivider(width, theme.dividerColor)
-  echo ""
+  tb.resetAttributes()
 
-proc saveTranscript*(state: ReplState, path: string, agentName: string) =
-  ## Save the conversation transcript as Markdown.
-  var md = &"# Chat with {agentName}\n"
+# =============================================================================
+# Draw: search bar (inline at top of chat area)
+# =============================================================================
+
+proc drawSearchBar(tb: var TerminalBuffer, r: Rect, state: AppState) =
+  tb.setBackgroundColor(bgYellow)
+  tb.setForegroundColor(fgBlack, bright = true)
+  tb.fill(r.x1, r.y1, r.x2, r.y1, " ")
+  let label = &" Search: {state.searchQuery}_ ({state.searchHits.len} hits) "
+  tb.writeClipped(r.x1, r.y1, label, w(r))
+  tb.resetAttributes()
+
+# =============================================================================
+# Draw: save-path prompt overlay
+# =============================================================================
+
+proc drawSavePrompt(tb: var TerminalBuffer, root: Rect, state: AppState) =
+  let ww = min(60, w(root) - 4)
+  let hh = 5
+  let x1 = root.x1 + (w(root) - ww) div 2
+  let y1 = root.y1 + (h(root) - hh) div 2
+  let box = Rect(x1: x1, y1: y1, x2: x1 + ww - 1, y2: y1 + hh - 1)
+
+  tb.setBackgroundColor(bgBlack)
+  tb.setForegroundColor(fgWhite)
+  tb.fill(box.x1, box.y1, box.x2, box.y2, " ")
+
+  var bb = newBoxBuffer(tb.width, tb.height)
+  bb.drawRect(box.x1, box.y1, box.x2, box.y2, doubleStyle = true)
+  tb.setForegroundColor(fgCyan, bright = true)
+  tb.write(bb)
+  tb.resetAttributes()
+
+  let inner = inset(box, 2, 1)
+  tb.setForegroundColor(fgWhite, bright = true)
+  tb.write(inner.x1, inner.y1, "Save transcript to (Enter to confirm, Esc to cancel):")
+  tb.setForegroundColor(fgWhite)
+  tb.write(inner.x1, inner.y1 + 2, "> " & state.savePathBuf & "_")
+  tb.resetAttributes()
+
+# =============================================================================
+# Transcript saving
+# =============================================================================
+
+proc saveTranscript(state: AppState, path: string) =
+  var md = &"# Chat with {state.agentName}\n"
   md &= &"_Saved {now().format(\"yyyy-MM-dd HH:mm:ss\")}_\n\n---\n\n"
-
-  for msg in state.history:
+  for msg in state.messages:
     let ts = msg.timestamp.format("HH:mm:ss")
     case msg.role
-    of "user":
+    of crUser:
       md &= &"**You** _{ts}_\n\n{msg.text}\n\n"
-    of "assistant":
+    of crAssistant:
       md &= &"**{msg.name}** _{ts}_"
       if msg.tokens > 0:
         md &= &" ({msg.tokens} tokens, {msg.elapsed.inMilliseconds}ms)"
       md &= &"\n\n{msg.text}\n\n"
-    of "error":
-      md &= &"> ⚠️ Error: {msg.text}\n\n"
-    else:
+    of crError:
+      md &= &"> Error: {msg.text}\n\n"
+    of crTool:
+      md &= &"    {msg.text}\n\n"
+    of crMeta:
       md &= &"_{msg.text}_\n\n"
     md &= "---\n\n"
-
   writeFile(path, md)
 
 # =============================================================================
-# Input Handling (reused from tick.nim patterns)
+# Search
 # =============================================================================
 
-const
-  BpEnable  = "\x1b[?2004h"
-  BpDisable = "\x1b[?2004l"
-  BpStart   = "\x1b[200~"
-  BpEnd     = "\x1b[201~"
-
-when defined(windows):
-  proc kbhit(): cint {.importc: "_kbhit", header: "<conio.h>".}
-
-  proc replReadPasteAware*(timeoutMs: int = 50): string =
-    result = stdin.readLine()
-    while true:
-      sleep(timeoutMs)
-      if kbhit() == 0: break
-      result.add "\n" & stdin.readLine()
-else:
-  import std/selectors
-
-  proc replReadPasteAware*(timeoutMs: int = 50): string =
-    result = stdin.readLine()
-    let sel = newSelector[int]()
-    sel.registerHandle(stdin.getFileHandle().int, {Read}, 0)
-    defer: sel.close()
-    while true:
-      let ready = sel.select(timeoutMs)
-      if ready.len == 0: break
-      result.add "\n" & stdin.readLine()
-
-proc replEnableBracketedPaste() =
-  stdout.write BpEnable
-  stdout.flushFile()
-
-proc replDisableBracketedPaste() =
-  stdout.write BpDisable
-  stdout.flushFile()
-
-proc replReadBlock(): string =
-  var line = stdin.readLine()
-  if line.contains(BpStart):
-    var lines: seq[string] = @[]
-    line = line.replace(BpStart, "")
-    while true:
-      if line.contains(BpEnd):
-        lines.add line.replace(BpEnd, "")
-        break
-      lines.add line
-      line = stdin.readLine()
-    return lines.join("\n")
-  return line
-
-proc readUserInput(): string =
-  ## Try bracketed paste first, fall back to paste-aware reader.
-  result = replReadBlock()
-  if result.len == 0:
-    result = replReadPasteAware()
+proc updateSearch(state: var AppState) =
+  state.searchHits.setLen(0)
+  if state.searchQuery.strip().len == 0: return
+  let q = state.searchQuery.toLowerAscii()
+  for i, msg in state.messages:
+    if msg.text.toLowerAscii().contains(q):
+      state.searchHits.add(i)
 
 # =============================================================================
-# Prompt
+# SQLite history loading
 # =============================================================================
 
-proc showPrompt*(theme: ReplTheme) =
-  ## Show the input prompt.
-  stdout.write $styled("  ❯ ").fg(theme.promptArrow).style(bold)
-  stdout.flushFile()
+proc loadHistoryFromDb(state: var AppState, agentStore: AgentStore, agentName: string) =
+  ## Load prior chat history from the AgentStore SQLite database.
+  ## Converts ChatHistoryRow records into ChatMessage display objects.
+  ## Rows are returned newest-first from the DB, so we reverse for display.
+  if agentStore.isNil:
+    return
+
+  let limit = if state.settings.maxHistoryLoad > 0: state.settings.maxHistoryLoad else: 500
+  let rows = agentStore.getChatHistory(limit)
+
+  if rows.len == 0:
+    return
+
+  # rows are newest-first; reverse to chronological for display
+  var chatMsgs: seq[ChatMessage]
+  for i in countdown(rows.high, 0):
+    let row = rows[i]
+    let role = case row.role
+      of "user":      crUser
+      of "assistant":  crAssistant
+      of "error":      crError
+      else:            crMeta
+
+    # Parse timestamp from ISO string, fallback to now()
+    var ts = now()
+    try:
+      ts = parse(row.ts, "yyyy-MM-dd'T'HH:mm:sszzz", utc())
+    except CatchableError:
+      try:
+        ts = parse(row.ts, "yyyy-MM-dd HH:mm:ss", utc())
+      except CatchableError:
+        discard
+
+    chatMsgs.add ChatMessage(
+      role:      role,
+      name:      if role == crAssistant: agentName else: "",
+      text:      row.content,
+      timestamp: ts,
+      tokens:    row.tokensUsed,
+      elapsed:   initDuration(milliseconds = row.elapsedMs),
+    )
+
+  if chatMsgs.len > 0:
+    # Separator between loaded history and new messages
+    state.messages.add ChatMessage(
+      role: crMeta, timestamp: now(),
+      text: &"── Loaded {chatMsgs.len} messages from previous sessions ──",
+    )
+    for msg in chatMsgs:
+      state.messages.add msg
+    state.messages.add ChatMessage(
+      role: crMeta, timestamp: now(),
+      text: "── End of history ──",
+    )
 
 # =============================================================================
-# Waiting / Thinking Indicator
+# Process a TickResult into chat messages
 # =============================================================================
 
-proc replWaitForTurn*(a: Agent, fut: Future[TickResult], theme: ReplTheme): TickResult =
-  ## Wait for a chatTurn to complete, showing a spinner/indicator.
-  when defined(llmm_repl_termui):
-    let spinner = termuiSpinner(&"  {a.name} is thinking...")
-    while not fut.finished:
-      asyncdispatch.poll(50)
-    let res = fut.read()
-    if res.error.isSome:
-      spinner.fail(res.error.get())
-    else:
-      spinner.complete("Done")
-    return res
-  else:
-    # Simple animated dots fallback
-    stdout.write $styled(&"  {a.name} is thinking").fg(theme.metaText).style(dim)
-    stdout.flushFile()
-    var dots = 0
-    while not fut.finished:
-      asyncdispatch.poll(100)
-      dots = (dots + 1) mod 4
-      stdout.write "\r"
-      stdout.write $styled(&"  {a.name} is thinking" & ".".repeat(dots) & " ".repeat(3 - dots)).fg(theme.metaText).style(dim)
-      stdout.flushFile()
-
-    # Clear the thinking line
-    stdout.write "\r"
-    stdout.eraseLine()
-    stdout.flushFile()
-    return fut.read()
-
-# =============================================================================
-# Process TickResult into display
-# =============================================================================
-
-proc displayTickResult*(res: TickResult, agentName: string, state: var ReplState) =
-  ## Process and display a TickResult with full event visibility.
-  let theme = state.settings.theme
-  let width = state.settings.getContentWidth()
-
-  # Show tool calls in debug mode
-  if state.settings.showDebug and res.toolCalls.len > 0:
-    echo ""
-    echo $styled("    ── Tools ──").fg(theme.toolLabel).style(dim)
-    for i, ev in res.events:
+proc processTickResult(state: var AppState, res: TickResult) =
+  # Tool events
+  if state.settings.showDebug:
+    for ev in res.events:
       case ev.kind
       of aekToolCall:
-        printToolCall(ev.callToolName, $ev.callToolArgs, theme)
+        state.messages.add ChatMessage(
+          role: crTool, timestamp: now(),
+          text: &"CALL {ev.callToolName}({ev.callToolArgs})",
+        )
       of aekToolResult:
-        let ok = ev.resultOk
-        printToolResult(ev.resultToolId, ok, $ev.resultOutput, theme)
-      else:
-        discard
-    echo $styled("    ───────────").fg(theme.toolLabel).style(dim)
-    echo ""
+        let icon = if ev.resultOk: "OK" else: "ERR"
 
-  # Show assistant response
+        let raw = $ev.resultOutput
+        let preview = raw[0 ..< min(raw.len, 80)].replace("\n", " ")
+        state.messages.add ChatMessage(
+          role: crTool, timestamp: now(),
+          text: &"  {icon}: {preview}",
+        )
+      else: discard
+
+  # Main response
   if res.error.isSome:
-    printError(res.error.get(), theme)
-    state.history.add ReplMessage(
-      role: "error", text: res.error.get(), timestamp: now()
+    state.messages.add ChatMessage(
+      role: crError, timestamp: now(),
+      text: res.error.get(),
     )
   elif res.text.len > 0:
-    printAssistantMessage(
-      agentName, res.text, theme, width,
-      ts = now(), showTs = state.settings.showTimestamp,
-      tokens = res.tokensUsed, elapsed = res.elapsed,
-      showStats = state.settings.showStats
-    )
-    state.history.add ReplMessage(
-      role: "assistant", name: agentName, text: res.text,
-      timestamp: now(), tokens: res.tokensUsed, elapsed: res.elapsed
+    state.messages.add ChatMessage(
+      role: crAssistant,
+      name: state.agentName,
+      text: res.text,
+      timestamp: now(),
+      tokens: res.tokensUsed,
+      elapsed: res.elapsed,
     )
 
+  # NOTE: We do NOT need to persist here — chatTurn() in tick.nim already
+  # writes user/assistant/error entries to the AgentStore SQLite database.
+
+  state.rebuildRendered()
+  state.chatScroll = 0  # snap to bottom on new message
+
 # =============================================================================
-# Command Processing
+# Execute a palette command
 # =============================================================================
 
-proc processCommand*(cmd: string, state: var ReplState, agentName: string): bool =
-  ## Process a REPL command. Returns true if the command was handled.
-  let parts = cmd.split(" ", maxsplit = 1)
-  let command = parts[0].toLowerAscii()
-  let arg = if parts.len > 1: parts[1].strip() else: ""
-  let theme = state.settings.theme
-  let width = state.settings.getContentWidth()
-
-  case command
-  of ":help":
-    printHelp(theme, width)
-    return true
-
-  of ":paste":
-    return false  # Handled by caller
-
-  of ":clip":
-    return false  # Handled by caller
-
-  of ":history":
-    let n = if arg.len > 0: (try: parseInt(arg) except: 5) else: 5
-    printHistory(state, n, agentName)
-    return true
-
-  of ":save":
-    if arg.len == 0:
-      printError("Usage: :save <filepath>", theme)
-    else:
-      try:
-        saveTranscript(state, arg, agentName)
-        printMeta(&"Transcript saved to {arg}", theme)
-      except:
-        printError(&"Failed to save: {getCurrentExceptionMsg()}", theme)
-    return true
-
-  of ":clear":
-    eraseScreen(stdout)
-    setCursorPos(stdout, 0, 0)
-    printHeader(agentName, theme, width)
-    return true
-
-  of ":debug":
+proc runPaletteCommand(state: var AppState, cmdId: string) =
+  case cmdId
+  of "debug":
     state.settings.showDebug = not state.settings.showDebug
-    let status = if state.settings.showDebug: "ON" else: "OFF"
-    printMeta(&"Debug mode: {status}", theme)
-    return true
-
-  of ":stats":
+    state.setToast("Debug: " & (if state.settings.showDebug: "ON" else: "OFF"))
+    state.rebuildRendered()
+  of "stats":
     state.settings.showStats = not state.settings.showStats
-    let status = if state.settings.showStats: "ON" else: "OFF"
-    printMeta(&"Stats display: {status}", theme)
-    return true
-
-  of ":timestamps":
-    state.settings.showTimestamp = not state.settings.showTimestamp
-    let status = if state.settings.showTimestamp: "ON" else: "OFF"
-    printMeta(&"Timestamps: {status}", theme)
-    return true
-
-  of ":wrap":
+    state.setToast("Stats: " & (if state.settings.showStats: "ON" else: "OFF"))
+    state.rebuildRendered()
+  of "timestamps":
+    state.settings.showTimestamps = not state.settings.showTimestamps
+    state.setToast("Timestamps: " & (if state.settings.showTimestamps: "ON" else: "OFF"))
+    state.rebuildRendered()
+  of "wrap":
     state.settings.wordWrap = not state.settings.wordWrap
-    let status = if state.settings.wordWrap: "ON" else: "OFF"
-    printMeta(&"Word wrap: {status}", theme)
-    return true
+    state.setToast("Word wrap: " & (if state.settings.wordWrap: "ON" else: "OFF"))
+    state.rebuildRendered()
+  of "clear":
+    state.messages.setLen(0)
+    state.rendered.setLen(0)
+    state.chatScroll = 0
+    state.setToast("Chat cleared")
+  of "save":
+    state.overlay = okSavePrompt
+    state.savePathBuf = "chat_" & now().format("yyyyMMdd-HHmmss") & ".md"
+  of "paste":
+    state.inputMode = imCompose
+    state.composeLines.setLen(0)
+    state.inputBuf = ""
+    state.setToast("Compose mode — type freely, Ctrl+Enter sends")
+  of "help":
+    state.overlay = okHelp
+  of "quit":
+    state.running = false
+  else:
+    state.setToast("Unknown command: " & cmdId)
 
-  of ":width":
-    if arg.len == 0:
-      printMeta(&"Current width: {state.settings.getContentWidth()}", theme)
-    else:
-      state.settings.maxWidth = try: parseInt(arg) except: 0
-      printMeta(&"Max width set to: {state.settings.getContentWidth()}", theme)
-    return true
+# =============================================================================
+# Input handling
+# =============================================================================
+
+proc handleInputNormal(state: var AppState, key: Key): Option[string] =
+  ## Handle keys in normal single-line input mode.
+  ## Returns Some(text) if user submitted a message.
+  case key
+  of Key.Enter:
+    let text = state.inputBuf.strip()
+    if text.len > 0:
+      state.inputBuf = ""
+      state.inputCursor = 0
+      return some(text)
+
+  of Key.Backspace:
+    if state.inputCursor > 0:
+      state.inputBuf.delete(state.inputCursor - 1 ..< state.inputCursor)
+      dec state.inputCursor
+
+  of Key.Delete:
+    if state.inputCursor < state.inputBuf.len:
+      state.inputBuf.delete(state.inputCursor ..< state.inputCursor + 1)
+
+  of Key.Left:
+    state.inputCursor = max(0, state.inputCursor - 1)
+
+  of Key.Right:
+    state.inputCursor = min(state.inputBuf.len, state.inputCursor + 1)
+
+  of Key.Home:
+    state.inputCursor = 0
+
+  of Key.End:
+    state.inputCursor = state.inputBuf.len
+
+  of Key.CtrlA:
+    state.inputCursor = 0
+
+  of Key.CtrlE:
+    state.inputCursor = state.inputBuf.len
+
+  of Key.CtrlU:
+    # Kill line before cursor
+    state.inputBuf = state.inputBuf[state.inputCursor ..< state.inputBuf.len]
+    state.inputCursor = 0
+
+  of Key.CtrlK:
+    # Kill line after cursor
+    state.inputBuf = state.inputBuf[0 ..< state.inputCursor]
+
+  of Key.CtrlW:
+    # Delete word backwards
+    var pos = state.inputCursor
+    while pos > 0 and state.inputBuf[pos - 1] == ' ': dec pos
+    while pos > 0 and state.inputBuf[pos - 1] != ' ': dec pos
+    state.inputBuf.delete(pos ..< state.inputCursor)
+    state.inputCursor = pos
 
   else:
-    return false  # Not a recognized command
+    let chOpt = keyToChar(key)
+    if chOpt.isSome:
+      state.inputBuf.insert($chOpt.get, state.inputCursor)
+      inc state.inputCursor
+
+  return none(string)
+
+proc handleInputCompose(state: var AppState, key: Key): Option[string] =
+  ## Handle keys in multi-line compose mode.
+  case key
+  of Key.Escape:
+    state.inputMode = imNormal
+    state.inputBuf = ""
+    state.composeLines.setLen(0)
+    state.setToast("Compose cancelled")
+    return none(string)
+
+  of Key.Enter:
+    # In compose, plain Enter adds a line
+    state.composeLines.add(state.inputBuf)
+    state.inputBuf = ""
+    state.inputCursor = 0
+    return none(string)
+
+  of Key.CtrlJ:
+    # Ctrl+Enter / Ctrl+J: submit the composed text
+    if state.inputBuf.strip().len > 0:
+      state.composeLines.add(state.inputBuf)
+    let text = state.composeLines.join("\n").strip()
+    state.inputMode = imNormal
+    state.inputBuf = ""
+    state.inputCursor = 0
+    state.composeLines.setLen(0)
+    if text.len > 0:
+      return some(text)
+    return none(string)
+
+  of Key.Backspace:
+    if state.inputBuf.len > 0:
+      state.inputBuf.delete(max(0, state.inputBuf.len - 1) ..< state.inputBuf.len)
+    elif state.composeLines.len > 0:
+      state.inputBuf = state.composeLines[^1]
+      state.composeLines.setLen(state.composeLines.len - 1)
+      state.inputCursor = state.inputBuf.len
+    return none(string)
+
+  else:
+    let chOpt = keyToChar(key)
+    if chOpt.isSome:
+      state.inputBuf.insert($chOpt.get, state.inputBuf.len)
+      state.inputCursor = state.inputBuf.len
+    return none(string)
+
+proc handleOverlayKeys(state: var AppState, key: Key) =
+  case state.overlay
+  of okHelp:
+    if key in {Key.Escape, Key.QuestionMark, Key.Enter}:
+      state.overlay = okNone
+
+  of okPalette:
+    let cmds = filterCommands(state.paletteQuery)
+    let idxMax = max(0, cmds.len - 1)
+    case key
+    of Key.Escape:
+      state.overlay = okNone
+    of Key.Up:
+      state.paletteIdx = clampI(state.paletteIdx - 1, 0, idxMax)
+    of Key.Down:
+      state.paletteIdx = clampI(state.paletteIdx + 1, 0, idxMax)
+    of Key.Enter:
+      if cmds.len > 0:
+        let idx = clampI(state.paletteIdx, 0, idxMax)
+        state.runPaletteCommand(cmds[idx].id)
+      state.overlay = okNone
+    of Key.Backspace:
+      if state.paletteQuery.len > 0:
+        state.paletteQuery.setLen(state.paletteQuery.len - 1)
+        state.paletteIdx = 0
+    else:
+      let chOpt = keyToChar(key)
+      if chOpt.isSome:
+        state.paletteQuery.add(chOpt.get)
+        state.paletteIdx = 0
+
+  of okSavePrompt:
+    case key
+    of Key.Escape:
+      state.overlay = okNone
+    of Key.Enter:
+      try:
+        state.saveTranscript(state.savePathBuf)
+        state.setToast("Saved to " & state.savePathBuf)
+      except CatchableError as e:
+        state.setToast("Save failed: " & e.msg)
+      state.overlay = okNone
+    of Key.Backspace:
+      if state.savePathBuf.len > 0:
+        state.savePathBuf.setLen(state.savePathBuf.len - 1)
+    else:
+      let chOpt = keyToChar(key)
+      if chOpt.isSome:
+        state.savePathBuf.add(chOpt.get)
+
+  of okNone:
+    discard
+
+proc handleSearchKeys(state: var AppState, key: Key) =
+  case key
+  of Key.Escape, Key.Enter:
+    state.searchMode = false
+  of Key.Backspace:
+    if state.searchQuery.len > 0:
+      state.searchQuery.setLen(state.searchQuery.len - 1)
+      state.updateSearch()
+  else:
+    let chOpt = keyToChar(key)
+    if chOpt.isSome:
+      state.searchQuery.add(chOpt.get)
+      state.updateSearch()
+
+proc handleGlobalKeys(state: var AppState, key: Key) =
+  ## Global shortcuts that apply regardless of input mode.
+  case key
+  of Key.CtrlQ:
+    state.running = false
+  of Key.CtrlP:
+    state.overlay = okPalette
+    state.paletteQuery = ""
+    state.paletteIdx = 0
+  of Key.CtrlO:
+    state.inputMode = imCompose
+    state.composeLines.setLen(0)
+    state.inputBuf = ""
+    state.setToast("Compose mode")
+  of Key.CtrlS:
+    state.overlay = okSavePrompt
+    state.savePathBuf = "chat_" & now().format("yyyyMMdd-HHmmss") & ".md"
+  of Key.CtrlD:
+    state.runPaletteCommand("debug")
+  of Key.CtrlT:
+    state.runPaletteCommand("stats")
+  of Key.CtrlL:
+    state.runPaletteCommand("clear")
+  of Key.CtrlF:
+    state.searchMode = true
+    state.searchQuery = ""
+    state.searchHits.setLen(0)
+  of Key.QuestionMark:
+    if state.inputMode == imNormal and state.inputBuf.len == 0:
+      state.overlay = okHelp
+  of Key.PageUp:
+    state.chatScroll = min(state.chatScroll + 10, max(0, state.rendered.len - 5))
+  of Key.PageDown:
+    state.chatScroll = max(0, state.chatScroll - 10)
+  of Key.Up:
+    state.chatScroll = min(state.chatScroll + 3, max(0, state.rendered.len - 5))
+  of Key.Down:
+    state.chatScroll = max(0, state.chatScroll - 3)
+  else:
+    discard
+
+proc handleMouse(state: var AppState, mi: MouseInfo) =
+  if mi.scroll:
+    let delta = if mi.scrollDir == sdUp: 3 else: -3
+    state.chatScroll = clampI(
+      state.chatScroll + delta,
+      0,
+      max(0, state.rendered.len - 5)
+    )
 
 # =============================================================================
-# Main Chat REPL (upgraded)
+# Main chat REPL
 # =============================================================================
 
-proc chatRepl*(a: Agent, firstMsg: string = "", settings: ReplSettings = defaultSettings()) =
-  ## Opens a rich interactive chat REPL with the agent.
+proc exitProc() {.noconv.} =
+  try:
+    illwillDeinit()
+  except CatchableError:
+    discard
+  showCursor()
+  quit(0)
+
+proc chatRepl*(
+  a:         Agent,
+  firstMsg:  string       = "",
+  settings:  ReplSettings = defaultSettings(),
+) =
+  ## Opens a fullscreen illwill chat TUI with the agent.
   ##
   ## Features:
-  ##   - Styled message display with word wrapping
-  ##   - Tool call visibility (toggle with :debug)
-  ##   - Token/time stats (toggle with :stats)
-  ##   - Chat history (:history), transcript saving (:save)
-  ##   - Multi-line paste support (bracketed paste + :paste mode)
+  ##   - SQLite-backed chat history (loads prior sessions on startup)
+  ##   - Scrollable chat history with word wrapping
+  ##   - Full line editor (Home/End, Ctrl+A/E/U/K/W, cursor movement)
+  ##   - Multi-line compose mode (Ctrl+O)
+  ##   - Command palette (Ctrl+P)
+  ##   - Search through messages (Ctrl+F)
+  ##   - Tool-call debug view (Ctrl+D)
+  ##   - Token/latency stats (Ctrl+T)
+  ##   - Transcript saving (Ctrl+S)
+  ##   - Mouse scroll
   ##   - Animated thinking indicator
-  ##   - Customizable theme and settings
+  ##   - Help overlay (?)
+  ##   - Customizable theme
 
-  var state = initReplState()
+  # Initialize illwill
+  illwillInit(fullscreen = true, mouse = true)
+  setControlCHook(exitProc)
+  hideCursor()
+
+  var state: AppState
+  state.running = true
   state.settings = settings
+  state.agentName = a.cfg.name
+  state.inputBuf = ""
+  state.inputCursor = 0
+  state.inputMode = imNormal
+  state.overlay = okNone
 
-  let theme = state.settings.theme
-  let width = state.settings.getContentWidth()
+  # Load prior chat history from SQLite if enabled
+  if state.settings.loadHistory and not a.state.agentStore.isNil:
+    state.loadHistoryFromDb(a.state.agentStore, a.cfg.name)
 
-  # Print header
-  printHeader(a.name, theme, width)
+  # Welcome meta message
+  state.messages.add ChatMessage(
+    role: crMeta, timestamp: now(),
+    text: &"Connected to {a.cfg.name}. Type a message and press Enter.",
+  )
 
-  replEnableBracketedPaste()
-  defer: replDisableBracketedPaste()
+  # Handle firstMsg
+  var pendingFuture: Option[Future[TickResult]] = none(Future[TickResult])
 
-  # Handle firstMsg if provided
   if firstMsg.len > 0:
-    printUserMessage(firstMsg, theme, width, now(), state.settings.showTimestamp)
-    state.history.add ReplMessage(
-      role: "user", text: firstMsg, timestamp: now()
+    state.messages.add ChatMessage(
+      role: crUser, timestamp: now(), text: firstMsg,
     )
+    state.thinking = true
+    # chatTurn persists user + assistant messages to SQLite
+    pendingFuture = some(a.chatTurn(firstMsg))
 
-    let fut = a.chatTurn(firstMsg)
-    let res = replWaitForTurn(a, fut, theme)
-    displayTickResult(res, a.name, state)
+  state.rebuildRendered()
 
-  # Main loop
+  # ---------- Main loop ----------
   while state.running:
-    showPrompt(theme)
+    let tNow = epochTime()
 
-    var raw: string
-    try:
-      raw = readUserInput()
-    except EOFError:
-      echo ""
-      break
+    # Advance thinking animation
+    if state.thinking:
+      state.thinkFrame += 1
 
-    let cmd = raw.strip()
-    let low = cmd.toLowerAscii()
+    # Check if agent finished
+    if pendingFuture.isSome and pendingFuture.get.finished:
+      state.thinking = false
+      let res = pendingFuture.get.read()
+      state.processTickResult(res)
+      pendingFuture = none(Future[TickResult])
 
-    # Exit
-    if low in ["exit", "quit", "q"]:
-      echo ""
-      echo $styled("  👋 Session ended.").fg(theme.metaText)
-      if state.history.len > 0:
-        echo $styled(&"     {state.history.len} messages exchanged.").fg(theme.metaText).style(dim)
-      echo ""
-      break
+    # Poll async if we have a pending future
+    if pendingFuture.isSome:
+      try:
+        asyncdispatch.poll(0)
+      except CatchableError:
+        discard
 
-    # Empty input
-    if cmd.len == 0:
-      continue
+    # ---------- Render ----------
+    var tb = newTerminalBuffer(terminalWidth(), terminalHeight())
 
-    # Commands
-    if cmd.startsWith(":"):
-      if processCommand(cmd, state, a.name):
-        continue
+    let root = Rect(x1: 0, y1: 0, x2: tb.width - 1, y2: tb.height - 1)
+    let headerH = 1
+    let footerH = 1
+    let inputH = if state.inputMode == imCompose:
+      clampI(state.composeLines.len + 4, 5, max(5, h(root) div 3))
+    else: 3
 
-      # Handle :paste specially
-      if cmd == ":paste":
-        echo $styled("  📋 Paste mode — end with :end").fg(theme.metaText).style(dim)
-        var lines: seq[string] = @[]
-        while true:
-          let line = stdin.readLine()
-          if line.strip() == ":end": break
-          lines.add line
-        raw = lines.join("\n")
-        if raw.strip().len == 0: continue
+    # Layout regions
+    let headerR = Rect(x1: root.x1, y1: root.y1, x2: root.x2, y2: root.y1 + headerH - 1)
+    let footerR = Rect(x1: root.x1, y1: root.y2 - footerH + 1, x2: root.x2, y2: root.y2)
+    let inputR  = Rect(x1: root.x1, y1: footerR.y1 - inputH, x2: root.x2, y2: footerR.y1 - 1)
 
-      # Handle :clip
-      elif cmd == ":clip":
-        when defined(llmm_repl_clipboard):
-          raw = getClipboardText()
+    var chatY1 = headerR.y2 + 1
+    if state.searchMode:
+      chatY1 += 1  # make room for search bar
+
+    let chatR = Rect(x1: root.x1, y1: chatY1, x2: root.x2, y2: inputR.y1 - 1)
+
+    # Draw
+    drawHeader(tb, headerR, state)
+
+    if state.searchMode:
+      let searchR = Rect(x1: root.x1, y1: headerR.y2 + 1, x2: root.x2, y2: headerR.y2 + 1)
+      drawSearchBar(tb, searchR, state)
+
+    drawChatArea(tb, chatR, state)
+    drawInputArea(tb, inputR, state)
+    drawFooter(tb, footerR, state)
+
+    # Overlays (drawn last, on top)
+    case state.overlay
+    of okHelp:        drawHelpOverlay(tb, root)
+    of okPalette:     drawPalette(tb, root, state)
+    of okSavePrompt:  drawSavePrompt(tb, root, state)
+    of okNone:        discard
+
+    tb.display()
+
+    # ---------- Input ----------
+    let key = getKey()
+
+    if key == Key.Mouse:
+      let mi = getMouse()
+      handleMouse(state, mi)
+    elif key != Key.None:
+      # Overlays consume input first
+      if state.overlay != okNone:
+        handleOverlayKeys(state, key)
+      elif state.searchMode:
+        handleSearchKeys(state, key)
+      else:
+        # Check global shortcuts first
+        var handled = false
+        case key
+        of Key.CtrlQ, Key.CtrlP, Key.CtrlO, Key.CtrlS,
+           Key.CtrlD, Key.CtrlT, Key.CtrlL, Key.CtrlF,
+           Key.PageUp, Key.PageDown, Key.Up, Key.Down:
+
+          handleGlobalKeys(state, key)
+          handled = true
+        of Key.QuestionMark:
+          if state.inputMode == imNormal and state.inputBuf.len == 0:
+            handleGlobalKeys(state, key)
+            handled = true
+        of Key.Escape:
+          if state.inputMode == imCompose:
+            discard  # let compose handler deal with it
+          else:
+            state.running = false
+            handled = true
         else:
-          printError("Clipboard not compiled. Rebuild with -d:llmm_repl_clipboard", theme)
-          continue
+          discard
 
-    let userMsg = raw.strip()
-    if userMsg.len == 0:
-      continue
+        if not handled and not state.thinking:
+          # Route to input handler
+          let submitted = case state.inputMode
+            of imNormal:  handleInputNormal(state, key)
+            of imCompose: handleInputCompose(state, key)
 
-    # Display user message
-    printUserMessage(userMsg, theme, width, now(), state.settings.showTimestamp)
-    state.history.add ReplMessage(
-      role: "user", text: userMsg, timestamp: now()
-    )
+          if submitted.isSome:
+            let text = submitted.get
+            state.messages.add ChatMessage(
+              role: crUser, timestamp: now(), text: text,
+            )
+            state.rebuildRendered()
+            state.chatScroll = 0
 
-    # Execute chat turn
-    let fut = a.chatTurn(userMsg)
-    let res = replWaitForTurn(a, fut, theme)
-    displayTickResult(res, a.name, state)
+            # Start agent turn
+            # chatTurn() handles all SQLite persistence (user msg, assistant msg, events)
+            state.thinking = true
+            state.thinkFrame = 0
+            pendingFuture = some(a.chatTurn(text))
 
+    # Frame cap
+    sleep(16)  # ~60 FPS
+
+  # Cleanup
+  illwillDeinit()
+  showCursor()
+
+  # Print farewell to restored terminal
+  echo ""
+  echo &"  Session ended. {state.messages.len} messages exchanged."
+  echo ""
+
+# =============================================================================
+# Feedback session variant
+# =============================================================================
 
 proc feedback*(a: Agent, firstMsg: string = "") =
-  ## Opens a feedback-focused chat REPL with memory priority.
   const feedbackPrefix = """
 ## IMPORTANT: User Feedback Session
 
-The user is providing direct feedback. This information is HIGH PRIORITY and should be stored in memory.
+The user is providing direct feedback. This information is HIGH PRIORITY
+and should be stored in memory.
 
-For EVERY piece of feedback the user shares:
+For EVERY piece of feedback:
 1. Acknowledge it
-2. Store it using the memory tool with source: "correction" or "user_preference" and kind: "fact" or "lesson" as appropriate
+2. Store it using the memory tool
 3. Confirm what you stored
-
-Treat everything in this session as important context to remember for future interactions.
 """
-
-  let originalPrompt = a.systemPrompt
-  a.systemPrompt = a.systemPrompt & "\n\n" & feedbackPrefix
+  let original = a.cfg.systemPrompt
+  a.cfg.systemPrompt = a.cfg.systemPrompt & "\n\n" & feedbackPrefix
 
   var settings = defaultSettings()
   settings.showStats = true
-  settings.showDebug = true  # Show memory tool calls during feedback
-
-  # Override the header briefly
-  echo ""
-  echo $styled("  📝 Feedback Session").fg(yellow).style(bold)
-  echo $styled("     Everything you say will be prioritized for memory storage.").fg(brightBlack).style(dim)
-  echo ""
+  settings.showDebug = true
 
   chatRepl(a, firstMsg, settings)
 
-  a.systemPrompt = originalPrompt
+  a.cfg.systemPrompt = original

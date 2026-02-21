@@ -1,14 +1,3 @@
-## OAI Chat Session Types
-##
-## Defines the core types for managing chat sessions with the OpenAI API.
-## Sessions maintain message history, system prompts, and model configuration.
-##
-## Example:
-##   var session = newChatSession("gpt-4o", instructions = "You are a helpful assistant.")
-##   let response = await client.chat(session, "Hello!")
-##   echo response.text  # assistant reply
-##   echo session.len     # 2 (user + assistant)
-
 import std/[
 options
 ,json
