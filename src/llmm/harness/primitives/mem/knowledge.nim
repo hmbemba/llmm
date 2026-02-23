@@ -33,6 +33,7 @@ import debby/sqlite
 import ic
 import ../../../debby_utils
 import ../../../embeddings
+import ../../../providers/oai/oai_client
 
 # ============================================================================
 # Types
@@ -81,7 +82,7 @@ type
         dipReplace      ## delete existing doc (latest) and re-ingest
         dipVersion      ## keep existing and insert a new doc version
 
-    KnowledgeConfig* = object
+    KnowledgeConfig*           = object
         maxChunkChars*         = 1200
         chunkOverlap*          = 150
         chunkerKind*           = ckCharBased
@@ -91,6 +92,7 @@ type
         vectorExtPath*         : string
         duplicateIngestPolicy* = dipSkip
         searchOversample*      = 1      ## candidates = k * max(1, oversample); helpful once you add WHERE filters
+        client*                : OpenAIClient  ## Optional: for creating embedder internally
 
     KnowledgeStore* = ref object
         db*           : Db
@@ -504,11 +506,34 @@ proc initKnowledgeTables(ks: KnowledgeStore) =
         ON knowledge_document (source_type, source_path);
     """
 
+proc ensureEmbedder*(ks: KnowledgeStore) {.inline.} =
+    ## Lazily create embedder from config.client if needed.
+    ## Raises error if neither embedder nor client is available.
+    if not ks.embedder.isNil:
+        return
+    if ks.config.client.isNil:
+        raise newException(ValueError,
+            "KnowledgeStore requires an OpenAI client for embeddings. " &
+            "Set agent.cfg.knowledgeConfig.client = myOpenAIClient to enable knowledge features.")
+    ks.embedder = ks.config.client.newOpenAIEmbedder()
+    ic "Created embedder lazily from KnowledgeConfig.client"
+
 proc initVectorIndex*(ks: KnowledgeStore) =
     ## Call vector_init to register the embedding column for vector search.
+    ## This is called lazily when needed (during ingest/search).
     if not ks.vectorLoaded:
         icy "Vector extension not loaded, skipping vector_init"
         return
+
+    # Need embedder to get dimension - skip if no client available
+    # (will be called again later when client is available)
+    if ks.embedder.isNil:
+        if ks.config.client.isNil:
+            icy "No embedder or client available, skipping vector_init (will retry when needed)"
+            return
+        # Try to create embedder lazily
+        ks.embedder = ks.config.client.newOpenAIEmbedder()
+        ic "Created embedder lazily for vector_init"
 
     let opts = &"type=FLOAT32,dimension={ks.embedder.dim}"
     icb "Calling vector_init", opts
@@ -528,21 +553,29 @@ proc initVectorIndex*(ks: KnowledgeStore) =
 
 proc newKnowledgeStore*(
     db            : Db
-    ,embedder     : EmbeddingProvider
+    ,embedder     : EmbeddingProvider = nil
     ,vectorExtPath: string = ""
     ,config       : KnowledgeConfig = defaultKnowledgeConfig()
 ): KnowledgeStore =
     icb "=== Initializing KnowledgeStore ==="
 
     var cfg = config
-    if cfg.embeddingDim != embedder.dim:
+
+    # Create embedder from config.client if embedder not provided
+    # Note: embedder can be nil - will be created lazily when needed
+    var actualEmbedder = embedder
+    if actualEmbedder.isNil and not cfg.client.isNil:
+        actualEmbedder = cfg.client.newOpenAIEmbedder()
+        ic "Created embedder from KnowledgeConfig.client"
+
+    if not actualEmbedder.isNil and cfg.embeddingDim != actualEmbedder.dim:
         icy "KnowledgeConfig.embeddingDim != embedder.dim; overriding",
-            cfg.embeddingDim, "->", embedder.dim
-        cfg.embeddingDim = embedder.dim
+            cfg.embeddingDim, "->", actualEmbedder.dim
+        cfg.embeddingDim = actualEmbedder.dim
 
     result = KnowledgeStore(
         db            : db
-        ,embedder     : embedder
+        ,embedder     : actualEmbedder  # Can be nil - will check lazily
         ,vectorExtPath: vectorExtPath
         ,vectorLoaded : false
         ,config       : cfg
@@ -550,8 +583,8 @@ proc newKnowledgeStore*(
 
     result.initKnowledgeTables()
     result.loadVectorExtension()
-    if result.vectorLoaded:
-        result.initVectorIndex()
+    # Note: vector_init is called lazily when needed (during ingest/search)
+    # so users can use KnowledgeStore without embeddings for read operations
 
     let docCount   = result.db.query("SELECT count(*) as c FROM knowledge_document")[0][0].parseInt
     let chunkCount = result.db.query("SELECT count(*) as c FROM knowledge_chunk")[0][0].parseInt
@@ -709,6 +742,13 @@ proc ingestChunks*(
 ): Future[int] {.async.} =
     icb "ingestChunks", docId, pages.len, "pages"
 
+    # Lazy init vector index if needed (requires embedder)
+    if ks.vectorLoaded:
+        ks.initVectorIndex()
+
+    # Ensure we have an embedder for creating embeddings
+    ensureEmbedder(ks)
+
     var allChunks: seq[string]
     var chunkMeta: seq[tuple[pageNo: int, idx: int]]
 
@@ -858,6 +898,12 @@ proc search*(
     if not ks.vectorLoaded:
         icr "Vector extension not loaded — cannot perform semantic search"
         return @[]
+
+    # Lazy init vector index if needed (requires embedder)
+    ks.initVectorIndex()
+
+    # Ensure we have an embedder for the query
+    ensureEmbedder(ks)
 
     let kk = max(1, k)
 

@@ -37,7 +37,7 @@ import ./scheduler
 
 # We assume the consumer imports both this module and the agent module.
 # To avoid circular imports, we use a duck-typed approach via generics.
-# The Agent type just needs: .client, .cfg.id, .cfg.name, .state.agentStore.db,
+# The Agent type just needs: .cfg.knowledgeConfig.client, .cfg.id, .cfg.name, .state.agentStore.db,
 # and a chatTurn/ask proc.
 
 type
@@ -55,13 +55,15 @@ proc initScheduler*[A](agent: A): AgentScheduler =
     ## Creates the JobStore (uses agent's shared SQLite db) and AgentScheduler.
     ## 
     ## Call this during or after agent.new().
-    icb "Initializing scheduler for agent", agent.cfg.name, agent.cfg.id
+    let agentId = if agent.cfg.id.len == 0: "default" else: agent.cfg.id
+
+    icb "Initializing scheduler for agent", agent.cfg.name, agentId
 
     # Create the job store using the agent's shared db
     let jobStore = newJobStore(agent.state.agentStore.db)
 
     # Create the scheduler
-    let sched = newAgentScheduler(jobStore, agent.cfg.id)
+    let sched = newAgentScheduler(jobStore, agentId)
 
     # Wire up the execution callback — this is what runs the agent when a job fires.
     # We need {.gcsafe.} because taskman runs handlers in an async context.
@@ -106,7 +108,7 @@ proc schedule*[A](agent: A, sched: AgentScheduler, instruction: string): Future[
     ## Example:
     ##   let job = await agent.schedule(scheduler, "every morning do research on AI")
     icb "agent.schedule()", instruction
-    return await sched.scheduleJob(agent.client, instruction)
+    return await sched.scheduleJob(agent.cfg.knowledgeConfig.client, instruction)
 
 proc startScheduler*(sched: AgentScheduler, periodicCheckMs: int = 500): Future[void] {.async.} =
     ## Start the scheduler event loop. Use with asyncCheck for non-blocking:
@@ -121,7 +123,7 @@ proc listJobs*(sched: AgentScheduler): seq[Job] =
     sched.listJobs()
 
 proc getJob*(sched: AgentScheduler, uid: string): Option[Job] =
-    sched.getJob(uid)
+    if sched.jobs.hasKey(uid): some(sched.jobs[uid]) else: none(Job)
 
 proc cancelJob*(sched: AgentScheduler, uid: string) =
     let opt = sched.getJob(uid)

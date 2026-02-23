@@ -12,7 +12,9 @@
 #
 # Slash commands:
 #   /help, /paste, /clip, /sh, /!, /history, /dbhistory, /save,
-#   /clear, /debug, /stats, /timestamps, /wrap, /width, /cfg
+#   /clear, /debug, /stats, /timestamps, /wrap, /width, /cfg,
+#   /session (new, list, switch, rename, delete, info),
+#   /tools (list, add, remove, reload, create, install)
 #
 # Compile flags:
 #   -d:llmm_repl_termui     Enable termui spinner (requires --threads:on)
@@ -22,52 +24,43 @@
 #
 # =============================================================================
 
-# import std/[
-# json
-# ,times
-# ,options
-# ,asyncdispatch
-# ,strformat
-# ,strutils
-# ,sugar
-# ,tables
-# ,terminal
-# ,os
-# ,sequtils
-# ]
-
-# import rz, ic
-# import agent, sessions, store
-# import ../tools/base
-# import ../../general_helpers
-# import ../../providers/oai/oai_client
-# import ../../providers/oai/common/types
-# import ../../providers/oai/utils/builders
-# import ../../providers/oai/responses/types
-# import ../../providers/oai/responses/api
-# import ../../providers/oai/responses/utils
-
-# import ./mem/[memory, tool]
-
 # We import nimsterm for styled output
 import nimsterm
 import terminal
 import std/osproc  # For /sh and /! shell command execution
 import std/os      # For getEnv, getCurrentDir, getHomeDir (shell prompt)
 import std/algorithm  # For sortedByIt (search results ranking)
+import std/sequtils    # For filterIt, count
+import std/strutils  # For string manipulation
+import std/times     # For DateTime, Duration, now(), format()
+import std/strformat # For & string interpolation
+import std/tables    # For KV store
+import std/options   # For Option, some, none
+import std/asyncdispatch  # For async operations
+
+# Job scheduling (background jobs)
+import ./jobs/integration
+import ./jobs/scheduler
+import ./jobs/types as jobtypes
+import ./jobs/store as jobstore
+import ./jobs/schedule_tool
+
+# Dynamic tool loading
+import ./dynamic_tools
+
+# Agent store for database operations
+import ./store
+
+# Agent type for session management
+import ./agent
+import ./sessions  # For newChatSession
 
 when defined(llmm_repl_clipboard):
   import libclip/clipboard
-#discard setClipboardText "text here"
-#let content = getClipboardText()
-
 
 when defined(llmm_repl_termui):
   import termui
 
-
-# Re-export TickResult if not already visible from tick
-# (or just import tick and use its TickResult)
 
 # =============================================================================
 # REPL Configuration & State
@@ -118,6 +111,8 @@ type
     history*      : seq[ReplMessage]
     running*      : bool
     lastExitCode* : int    ## Exit code from the last /sh or /! command
+    dynamicTools* : DynamicToolRegistry  ## Dynamic tool management
+    kvStore*      : Table[string, string]  ## Key-value storage for /kv command
 
 # =============================================================================
 # Default Theme - Clean dark terminal aesthetic
@@ -163,6 +158,8 @@ proc initReplState*(): ReplState =
     ,history : @[]
     ,running : true
     ,lastExitCode : 0
+    ,dynamicTools : nil  # Initialized in chatRepl
+    ,kvStore : initTable[string, string]()
   )
 
 # =============================================================================
@@ -307,27 +304,91 @@ proc printHelp*(theme: ReplTheme, width: int) =
   echo ""
 
   let cmds = @[
-    ("/help",           "Show this help"),
-    ("/paste",          "Enter paste mode (end with /end)"),
-    ("/clip",           "Send clipboard as message"),
-    ("/sh <command>",   "Run a shell command (captured output)"),
-    ("/! <command>",    "Run interactive shell command (full terminal)"),
-    ("/search <query>", "Fuzzy search chat history"),
-    ("/history [n]",    "Show last n exchanges (default 5)"),
-    ("/dbhistory [n]",  "Show last n messages from SQLite (all sessions)"),
-    ("/save <path>",    "Save transcript to file"),
-    ("/clear",          "Clear screen and reprint header"),
-    ("/debug",          "Toggle tool-call visibility"),
-    ("/stats",          "Toggle token/time stats"),
-    ("/timestamps",     "Toggle timestamps"),
-    ("/wrap",           "Toggle word wrapping"),
-    ("/width <n>",      "Set max content width (0=auto)"),
-    ("/cfg",           "Show current agent + REPL configuration"),
-    ("exit / quit / q", "End session"),
+    ("/help",              "Show this help"),
+    ("/paste",             "Enter paste mode (end with /end)"),
+    ("/clip",              "Send clipboard as message"),
+    ("/sh <command>",      "Run a shell command (captured output)"),
+    ("/! <command>",       "Run interactive shell command (full terminal)"),
+    ("/search <query>",    "Fuzzy search chat history"),
+    ("/history [n]",       "Show last n exchanges (default 5)"),
+    ("/dbhistory [n]",     "Show last n messages from SQLite (all sessions)"),
+    ("/jobs",              "List scheduled jobs"),
+    ("/job <action> <uid>", "Manage a job: cancel | pause | resume | info"),
+    ("/tools",             "Tool management (list, add, remove, reload, create)"),
+    ("/kv",                "Key-value store (see /kv --help)"),
+    ("/save <path>",       "Save transcript to file"),
+    ("/clear",             "Clear screen and reprint header"),
+    ("/debug",             "Toggle tool-call visibility"),
+    ("/stats",             "Toggle token/time stats"),
+    ("/timestamps",        "Toggle timestamps"),
+    ("/wrap",              "Toggle word wrapping"),
+    ("/width <n>",         "Set max content width (0=auto)"),
+    ("/cfg",               "Show current agent + REPL configuration"),
+    ("/session",           "Session management (see below)"),
+    ("exit / quit / q",    "End session"),
   ]
 
   for (cmd, desc) in cmds:
-    let padded = cmd & " ".repeat(max(1, 22 - cmd.len))
+    let padded = cmd & " ".repeat(max(1, 24 - cmd.len))
+    echo $styled("    ").fg(theme.metaText) &
+         $styled(padded).fg(cyan).style(bold) &
+         $styled(desc).fg(theme.metaText)
+
+  echo ""
+  echo $styled("  Session Commands").fg(theme.headerAccent).style(bold, underline)
+  echo ""
+
+  let sessionCmds = @[
+    ("/session",              "Show current session info"),
+    ("/session list",         "List all sessions"),
+    ("/session new [name]",   "Create and switch to a new session"),
+    ("/session switch <q>",   "Switch to session by id or name"),
+    ("/session rename <name>","Rename current session"),
+    ("/session delete <q>",   "Delete a session by id or name"),
+  ]
+
+  for (cmd, desc) in sessionCmds:
+    let padded = cmd & " ".repeat(max(1, 28 - cmd.len))
+    echo $styled("    ").fg(theme.metaText) &
+         $styled(padded).fg(cyan).style(bold) &
+         $styled(desc).fg(theme.metaText)
+
+  echo ""
+  echo $styled("  Tool Commands").fg(theme.headerAccent).style(bold, underline)
+  echo ""
+
+  let toolCmds = @[
+    ("/tools list",           "List all registered tools"),
+    ("/tools list --source",  "Show source file for each tool"),
+    ("/tools add <file.nim>", "Load tools from Nim source file"),
+    ("/tools remove <name>",  "Unload a specific tool"),
+    ("/tools reload <name>",  "Reload a tool from source"),
+    ("/tools reload --all",   "Reload all dynamic tools"),
+    ("/tools create <name>",  "Generate skeleton tool file"),
+  ]
+
+  for (cmd, desc) in toolCmds:
+    let padded = cmd & " ".repeat(max(1, 28 - cmd.len))
+    echo $styled("    ").fg(theme.metaText) &
+         $styled(padded).fg(cyan).style(bold) &
+         $styled(desc).fg(theme.metaText)
+
+  echo ""
+  echo $styled("  KV Store Commands").fg(theme.headerAccent).style(bold, underline)
+  echo ""
+
+  let kvCmds = @[
+    ("/kv",                            "List all stored keys (values truncated to 100 chars)"),
+    ("/kv --help",                     "Show detailed KV help"),
+    ("/kv --key <key> --value <val>",  "Store a key-value pair"),
+    ("/kv add",                        "Interactive mode: prompts for key, then multi-line value"),
+    ("/kv get <key>",                  "Get value for a specific key"),
+    ("/kv delete <key>",               "Delete a key"),
+    ("/kv clear",                      "Clear all keys"),
+  ]
+
+  for (cmd, desc) in kvCmds:
+    let padded = cmd & " ".repeat(max(1, 34 - cmd.len))
     echo $styled("    ").fg(theme.metaText) &
          $styled(padded).fg(cyan).style(bold) &
          $styled(desc).fg(theme.metaText)
@@ -366,15 +427,6 @@ proc shellPrompt*(theme: ReplTheme, exitCode: int): string =
   result &= " " & $styled("@#").fg(theme.shellMarker).style(bold)
 
 proc runShellCommand*(command: string, theme: ReplTheme, interactive: bool = false, lastExitCode: int = 0): int =
-  ## Execute a shell command. Returns exit code.
-  ##
-  ## When interactive=false (default, /sh): captures stdout+stderr and
-  ## displays output inline with indented formatting.
-  ##
-  ## When interactive=true (/!): shows a shell prompt with cwd, then
-  ## hands over the full terminal to the subprocess so interactive TUIs,
-  ## prompts, and pagers work correctly. The REPL regains control once
-  ## the subprocess exits.
   result = 0
 
   if command.strip().len == 0:
@@ -382,10 +434,7 @@ proc runShellCommand*(command: string, theme: ReplTheme, interactive: bool = fal
     return 0
 
   if interactive:
-    # Show shell-style prompt line before the command
     echo "  " & shellPrompt(theme, lastExitCode) & " " & $styled(command).fg(theme.toolText)
-
-    # Hand over the terminal — stdin/stdout/stderr all go to the subprocess.
     try:
       result = execShellCmd(command)
       if result != 0:
@@ -394,17 +443,14 @@ proc runShellCommand*(command: string, theme: ReplTheme, interactive: bool = fal
       printError(&"Failed to run command: {getCurrentExceptionMsg()}", theme)
       result = 1
   else:
-    # Captured mode — show simple $ prefix
     echo $styled("  $ ").fg(theme.toolLabel).style(bold) &
          $styled(command).fg(theme.toolText)
-
     try:
       let (output, exitCode) = execCmdEx(command)
       result = exitCode
       if output.len > 0:
         for line in output.strip(trailing = true).split('\n'):
           echo $styled("    " & line).fg(theme.metaText)
-
       if exitCode != 0:
         echo $styled(&"    exit code: {exitCode}").fg(theme.errorText).style(dim)
     except OSError, IOError:
@@ -416,21 +462,14 @@ proc runShellCommand*(command: string, theme: ReplTheme, interactive: bool = fal
 # =============================================================================
 # Fuzzy Search
 # =============================================================================
-#
-# Subsequence fuzzy matcher inspired by fzf's scoring model.
-# Rewards: consecutive matches, matches after separators (space, _, -),
-#          matches at start of text, case-exact matches.
-# Penalties: gaps between matched characters.
-#
-# Returns (score, matchedIndices) where score <= 0 means no match.
 
 type
   FuzzyResult* = object
     score*   : int
-    indices* : seq[int]  ## Indices in haystack where pattern chars matched
+    indices* : seq[int]
 
   SearchHit* = object
-    msgIdx*    : int       ## Index into history or db row
+    msgIdx*    : int
     role*      : string
     name*      : string
     text*      : string
@@ -438,85 +477,16 @@ type
     tokens*    : int
     elapsed*   : Duration
     score*     : int
-    indices*   : seq[int]  ## Match positions in text (for highlighting)
+    indices*   : seq[int]
     source*    : string    ## "session" or "db"
 
-# proc fuzzyMatch*(pattern, haystack: string): FuzzyResult =
-#   ## Fuzzy-match pattern against haystack using subsequence matching.
-#   ## Returns score > 0 and matched indices on success, score <= 0 on failure.
-#   if pattern.len == 0:
-#     return FuzzyResult(score: 0, indices: @[])
-
-#   let pLow = pattern.toLowerAscii()
-#   let hLow = haystack.toLowerAscii()
-
-#   # First pass: can we match at all? (greedy forward scan)
-#   var matchIndices = newSeqOfCap[int](pattern.len)
-#   var pi = 0
-#   for hi in 0 ..< haystack.len:
-#     if pi < pLow.len and hLow[hi] == pLow[pi]:
-#       matchIndices.add(hi)
-#       inc pi
-#   if pi < pLow.len:
-#     return FuzzyResult(score: 0, indices: @[])  # Not all chars matched
-
-#   # Score the match
-#   const
-#     bonusConsecutive   = 8
-#     bonusSeparator     = 10  # Match right after space, _, -, /
-#     bonusFirstChar     = 12
-#     bonusCaseExact     = 4
-#     penaltyGap         = -3
-#     penaltyLeading     = -1  # Per char before first match (capped)
-#     maxLeadingPenalty  = -12
-
-#   var score = 0
-#   var prevIdx = -2  # Sentinel so first char isn't "consecutive"
-
-#   for i, hi in matchIndices:
-#     # Consecutive bonus
-#     if hi == prevIdx + 1:
-#       score += bonusConsecutive
-#     elif i > 0:
-#       # Gap penalty proportional to distance
-#       let gap = hi - prevIdx - 1
-#       score += penaltyGap * gap
-
-#     # Separator bonus: match right after a word boundary
-#     if hi == 0:
-#       score += bonusFirstChar
-#     elif hi > 0:
-#       let prev = haystack[hi - 1]
-#       if prev in {' ', '_', '-', '/', '\\', '.', ',', ':', ';', '(', '[', '{'}:
-#         score += bonusSeparator
-
-#     # Case-exact bonus
-#     if pattern.len > i and haystack[hi] == pattern[i]:
-#       score += bonusCaseExact
-
-#     prevIdx = hi
-
-#   # Leading gap penalty (penalize matches that start deep into the string)
-#   if matchIndices.len > 0:
-#     let leading = matchIndices[0]
-#     score += max(penaltyLeading * leading, maxLeadingPenalty)
-
-#   # Ensure score is at least 1 for any valid match
-#   if score <= 0: score = 1
-
-#   return FuzzyResult(score: score, indices: matchIndices)
-
-
 proc fuzzyMatchAll*(pattern, haystack: string): FuzzyResult =
-  ## Finds the BEST occurrence of pattern in haystack (not just first).
-  ## Scores all candidate matches and returns the highest.
   if pattern.len == 0:
     return FuzzyResult(score: 0, indices: @[])
 
   let pLow = pattern.toLowerAscii()
   let hLow = haystack.toLowerAscii()
 
-  # Collect all starting positions where first pattern char matches
   var startPositions: seq[int] = @[]
   for i in 0 ..< hLow.len:
     if hLow[i] == pLow[0]:
@@ -532,22 +502,20 @@ proc fuzzyMatchAll*(pattern, haystack: string): FuzzyResult =
     bonusCaseExact    = 4
     penaltyGap        = -3
     penaltyLeading    = -1
-    maxLeadingPenalty = -8   # Reduced from -12
+    maxLeadingPenalty = -8
 
   var bestScore = 0
   var bestIndices: seq[int] = @[]
 
   for startPos in startPositions:
-    # Greedy forward match from this start position
     var matchIndices: seq[int] = @[]
     var pi = 0
     for hi in startPos ..< hLow.len:
       if pi < pLow.len and hLow[hi] == pLow[pi]:
         matchIndices.add hi
         inc pi
-    if pi < pLow.len: continue  # Couldn't complete pattern from this start
+    if pi < pLow.len: continue
 
-    # Score this match
     var score = 0
     var prevIdx = startPos - 2
 
@@ -570,7 +538,6 @@ proc fuzzyMatchAll*(pattern, haystack: string): FuzzyResult =
 
       prevIdx = hi
 
-    # Reduced leading penalty
     if matchIndices.len > 0:
       let leading = matchIndices[0]
       score += max(penaltyLeading * leading, maxLeadingPenalty)
@@ -581,7 +548,6 @@ proc fuzzyMatchAll*(pattern, haystack: string): FuzzyResult =
       bestScore = score
       bestIndices = matchIndices
 
-  # Frequency bonus: reward messages with multiple occurrences
   var occurrences = 0
   var searchPos = 0
   while searchPos <= hLow.len - pLow.len:
@@ -591,40 +557,32 @@ proc fuzzyMatchAll*(pattern, haystack: string): FuzzyResult =
     else:
       inc searchPos
   if occurrences > 1:
-    bestScore += min((occurrences - 1) * 5, 20)  # Cap frequency bonus at +20
+    bestScore += min((occurrences - 1) * 5, 20)
 
   return FuzzyResult(score: bestScore, indices: bestIndices)
 
 proc highlightMatch*(text: string, indices: seq[int], matchColor: Color, baseColor: Color, maxLen: int = 120): string =
-  ## Render a text snippet with fuzzy-matched characters highlighted.
-  ## Truncates to maxLen, centering around the first match region.
-
-  # Collapse text to single line for display
   var flat = text.replace("\n", " ").replace("\r", "")
 
-  # Determine display window around the match
   var startPos = 0
   var endPos = flat.len
   if flat.len > maxLen and indices.len > 0:
-    # Center window around first match
     let center = indices[0]
     startPos = max(0, center - maxLen div 3)
     endPos = min(flat.len, startPos + maxLen)
     if startPos > 0:
-      startPos = max(0, startPos)  # Ensure valid
+      startPos = max(0, startPos)
 
   let snippet = flat[startPos ..< endPos]
   let prefix = if startPos > 0: "…" else: ""
   let suffix = if endPos < flat.len: "…" else: ""
 
-  # Build a set of match positions adjusted for the window
   var matchSet: set[uint16] = {}
   for idx in indices:
     let adjusted = idx - startPos
     if adjusted >= 0 and adjusted < snippet.len and adjusted <= high(uint16).int:
       matchSet.incl(adjusted.uint16)
 
-  # Render character by character
   result = prefix
   for i, ch in snippet:
     if i.uint16 in matchSet:
@@ -635,8 +593,6 @@ proc highlightMatch*(text: string, indices: seq[int], matchColor: Color, baseCol
 
 proc searchHistory*(state: ReplState, query: string, agentName: string,
                     agentStore: AgentStore = nil, maxResults: int = 15) =
-  ## Fuzzy-search chat history and display ranked results.
-  ## Searches in-memory session history first, then DB history if available.
   let theme = state.settings.theme
   let width = state.settings.getContentWidth()
 
@@ -646,7 +602,6 @@ proc searchHistory*(state: ReplState, query: string, agentName: string,
 
   var hits: seq[SearchHit] = @[]
 
-  # Search in-memory session history
   for i, msg in state.history:
     if msg.role notin ["user", "assistant"]: continue
     let fr = fuzzyMatchAll(query, msg.text)
@@ -664,12 +619,8 @@ proc searchHistory*(state: ReplState, query: string, agentName: string,
         source:    "session",
       )
 
-  # Search DB history if available (avoid duplicates with session)
   if not agentStore.isNil:
     let rows = agentStore.getChatHistory(500)
-    # We already have session messages, so only add DB rows
-    # that don't overlap with in-memory history.
-    # Simple heuristic: skip if text already seen in session hits.
     var seenTexts: seq[string] = @[]
     for h in hits:
       seenTexts.add h.text
@@ -678,7 +629,6 @@ proc searchHistory*(state: ReplState, query: string, agentName: string,
       if row.role notin ["user", "assistant"]: continue
       let fr = fuzzyMatchAll(query, row.content)
       if fr.score > 0:
-        # Skip if we already have this exact text from session
         var isDupe = false
         for seen in seenTexts:
           if seen == row.content:
@@ -712,10 +662,8 @@ proc searchHistory*(state: ReplState, query: string, agentName: string,
     printMeta(&"No matches for \"{query}\"", theme)
     return
 
-  # Sort by score descending
   hits.sort(proc(a, b: SearchHit): int = cmp(b.score, a.score))
 
-  # Cap results
   let showCount = min(maxResults, hits.len)
   let totalCount = hits.len
 
@@ -737,13 +685,11 @@ proc searchHistory*(state: ReplState, query: string, agentName: string,
     let sourceTag = if hit.source == "db": $styled(" [db]").fg(theme.metaText).style(dim) else: ""
     let scoreTag = $styled(&" ({hit.score})").fg(theme.statText).style(dim)
 
-    # Header: role, timestamp, source, score
     echo $styled(&"  {i+1}. ").fg(theme.metaText) &
          $styled(roleLabel).fg(roleColor).style(bold) &
          $styled(&" {ts}").fg(theme.metaText).style(dim) &
          sourceTag & scoreTag
 
-    # Highlighted snippet
     let snippet = highlightMatch(hit.text, hit.indices, theme.searchMatch, theme.metaText, maxLen = width - 8)
     echo "     " & snippet
     echo ""
@@ -787,8 +733,6 @@ proc printHistory*(state: ReplState, n: int, agentName: string) =
   echo ""
 
 proc printDbHistory*(agentStore: AgentStore, n: int, agentName: string, theme: ReplTheme, width: int, showStats: bool) =
-  ## Print chat history loaded directly from the SQLite database.
-  ## This shows messages across all sessions, not just the current one.
   if agentStore.isNil:
     printMeta("No database connected.", theme)
     return
@@ -801,10 +745,8 @@ proc printDbHistory*(agentStore: AgentStore, n: int, agentName: string, theme: R
   printMeta(&"Last {rows.len} messages from database (all sessions):", theme)
   thinDivider(width, theme.dividerColor)
 
-  # rows are newest-first; reverse for chronological display
   for i in countdown(rows.high, 0):
     let row = rows[i]
-    # Parse timestamp
     var ts = now()
     try:
       ts = parse(row.ts, "yyyy-MM-dd'T'HH:mm:sszzz", utc())
@@ -832,7 +774,6 @@ proc printDbHistory*(agentStore: AgentStore, n: int, agentName: string, theme: R
   echo ""
 
 proc saveTranscript*(state: ReplState, path: string, agentName: string) =
-  ## Save the conversation transcript as Markdown.
   var md = &"# Chat with {agentName}\n"
   md &= &"_Saved {now().format(\"yyyy-MM-dd HH:mm:ss\")}_\n\n---\n\n"
 
@@ -855,8 +796,6 @@ proc saveTranscript*(state: ReplState, path: string, agentName: string) =
   writeFile(path, md)
 
 proc saveTranscriptFromDb*(agentStore: AgentStore, path: string, agentName: string, limit: int = 500) =
-  ## Save the full conversation transcript from SQLite as Markdown.
-  ## Includes messages from all sessions.
   if agentStore.isNil:
     raise newException(IOError, "No database connected")
 
@@ -865,7 +804,6 @@ proc saveTranscriptFromDb*(agentStore: AgentStore, path: string, agentName: stri
   md &= &"_Saved {now().format(\"yyyy-MM-dd HH:mm:ss\")}_\n"
   md &= &"_{rows.len} messages from database_\n\n---\n\n"
 
-  # rows are newest-first; reverse for chronological output
   for i in countdown(rows.high, 0):
     let row = rows[i]
     let ts = row.ts
@@ -886,29 +824,36 @@ proc saveTranscriptFromDb*(agentStore: AgentStore, path: string, agentName: stri
   writeFile(path, md)
 
 # =============================================================================
-# SQLite History Loading
+# SQLite History Loading (session-aware)
 # =============================================================================
 
-proc loadHistoryFromDb*(state: var ReplState, agentStore: AgentStore, agentName: string, theme: ReplTheme, width: int) =
+proc loadHistoryFromDb*(state: var ReplState, agentStore: AgentStore, agentName: string,
+                        theme: ReplTheme, width: int, sessionId: string = "") =
   ## Load prior chat history from the AgentStore SQLite database into
-  ## the REPL state and display it. Called once at startup.
+  ## the REPL state and display it. Called once at startup or on session switch.
+  ##
+  ## If sessionId is provided, loads only that session's history.
+  ## Otherwise loads all history (backward compatible).
   if agentStore.isNil:
     return
 
   let limit = if state.settings.maxHistoryLoad > 0: state.settings.maxHistoryLoad else: 500
-  let rows = agentStore.getChatHistory(limit)
+
+  let rows = if sessionId.len > 0:
+    agentStore.getSessionChatHistory(sessionId, limit)
+  else:
+    agentStore.getChatHistory(limit)
 
   if rows.len == 0:
     return
 
-  printMeta(&"Loading {rows.len} messages from previous sessions...", theme)
+  let scopeLabel = if sessionId.len > 0: "this session" else: "previous sessions"
+  printMeta(&"Loading {rows.len} messages from {scopeLabel}...", theme)
   thinDivider(width, theme.dividerColor)
 
-  # rows are newest-first; reverse for chronological display
   for i in countdown(rows.high, 0):
     let row = rows[i]
 
-    # Parse timestamp
     var ts = now()
     try:
       ts = parse(row.ts, "yyyy-MM-dd'T'HH:mm:sszzz", utc())
@@ -920,7 +865,6 @@ proc loadHistoryFromDb*(state: var ReplState, agentStore: AgentStore, agentName:
 
     let elapsed = initDuration(milliseconds = row.elapsedMs)
 
-    # Add to in-memory history
     state.history.add ReplMessage(
       role:      row.role,
       name:      if row.role == "assistant": agentName else: "",
@@ -930,7 +874,6 @@ proc loadHistoryFromDb*(state: var ReplState, agentStore: AgentStore, agentName:
       elapsed:   elapsed,
     )
 
-    # Display the loaded message
     case row.role
     of "user":
       printUserMessage(row.content, theme, width, ts, showTs = true)
@@ -944,9 +887,728 @@ proc loadHistoryFromDb*(state: var ReplState, agentStore: AgentStore, agentName:
       discard
 
   thinDivider(width, theme.dividerColor)
-  printMeta("End of previous session history", theme)
+  printMeta("End of loaded history", theme)
   echo ""
 
+# =============================================================================
+# Session Management Commands
+# =============================================================================
+
+proc printSessionInfo*(a: Agent, theme: ReplTheme, width: int) =
+  ## Display info about the current session.
+  let s = a.state.session
+  echo ""
+  echo $styled("  Current Session").fg(theme.headerAccent).style(bold, underline)
+  thinDivider(width, theme.dividerColor)
+
+  proc kv(key, value: string) =
+    echo $styled("    " & key & ": ").fg(theme.metaText) &
+         $styled(value).fg(theme.userText)
+
+  kv("id", s.id)
+  kv("name", s.name)
+  kv("created", s.createdAt.format("yyyy-MM-dd HH:mm:ss"))
+  kv("messages (in-memory)", $a.state.session.messages.len)
+
+  if not a.state.agentStore.isNil:
+    let dbCount = a.state.agentStore.sessionMessageCount(s.id)
+    kv("messages (in db)", $dbCount)
+
+  thinDivider(width, theme.dividerColor)
+  echo ""
+
+proc printSessionList*(a: Agent, theme: ReplTheme, width: int) =
+  ## List all sessions from the database.
+  if a.state.agentStore.isNil:
+    printMeta("No database connected.", theme)
+    return
+
+  let sessions = a.state.agentStore.listSessions(limit = 30)
+  if sessions.len == 0:
+    printMeta("No sessions found.", theme)
+    return
+
+  let currentId = a.state.session.id
+
+  echo ""
+  echo $styled("  Sessions").fg(theme.headerAccent).style(bold, underline)
+  thinDivider(width, theme.dividerColor)
+
+  for s in sessions:
+    let isCurrent = s.sessionId == currentId
+    let marker = if isCurrent: "▸ " else: "  "
+    let nameColor = if isCurrent: theme.assistantLabel else: theme.userText
+    let msgCount = a.state.agentStore.sessionMessageCount(s.sessionId)
+
+    # Parse lastActiveAt for display
+    var lastActive = s.lastActiveAt
+    if lastActive.len > 19: lastActive = lastActive[0..18]  # Trim to readable
+
+    echo $styled(marker).fg(theme.assistantLabel).style(bold) &
+         $styled(s.name).fg(nameColor).style(bold) &
+         $styled(&" ({msgCount} msgs)").fg(theme.statText).style(dim) &
+         $styled(&"  last: {lastActive}").fg(theme.metaText).style(dim)
+    echo $styled(&"    id: {s.sessionId}").fg(theme.metaText).style(dim)
+
+  thinDivider(width, theme.dividerColor)
+  echo ""
+
+proc sessionSwitch*(a: Agent, state: var ReplState, idOrName: string, theme: ReplTheme, width: int) =
+  ## Switch the agent to a different session by id or name.
+  ## Clears in-memory REPL history and reloads from db.
+  if a.state.agentStore.isNil:
+    printError("No database connected.", theme)
+    return
+
+  let found = a.state.agentStore.findSession(idOrName)
+  if found.isNone:
+    printError(&"Session not found: \"{idOrName}\". Use /session list to see available sessions.", theme)
+    return
+
+  let session = found.get
+
+  if session.sessionId == a.state.session.id:
+    printMeta(&"Already in session \"{session.name}\".", theme)
+    return
+
+  # Switch the agent's session
+  a.switchSession(session.sessionId, session.name)
+
+  # Clear REPL state and reload
+  state.history = @[]
+
+  printMeta(&"Switched to session \"{session.name}\"", theme)
+
+  # Load this session's history from db
+  state.loadHistoryFromDb(a.state.agentStore, a.cfg.name, theme, width, session.sessionId)
+
+proc sessionNew*(a: Agent, state: var ReplState, name: string, theme: ReplTheme, width: int) =
+  ## Create a new session and switch to it.
+  let newSession = newChatSession(name)
+
+  # Switch the agent
+  a.switchSession(newSession.id, newSession.name)
+
+  # Clear REPL state
+  state.history = @[]
+
+  printMeta(&"Created and switched to new session \"{newSession.name}\" ({newSession.id})", theme)
+
+proc sessionRename*(a: Agent, newName: string, theme: ReplTheme) =
+  ## Rename the current session.
+  if newName.strip().len == 0:
+    printError("Usage: /session rename <new name>", theme)
+    return
+
+  if a.state.agentStore.isNil:
+    printError("No database connected.", theme)
+    return
+
+  let ok = a.state.agentStore.renameSession(a.state.session.id, newName.strip())
+  if ok:
+    a.state.session.name = newName.strip()
+    printMeta(&"Session renamed to \"{newName.strip()}\"", theme)
+  else:
+    printError("Failed to rename session.", theme)
+
+proc sessionDelete*(a: Agent, state: var ReplState, idOrName: string, theme: ReplTheme, width: int) =
+  ## Delete a session by id or name.
+  if a.state.agentStore.isNil:
+    printError("No database connected.", theme)
+    return
+
+  let found = a.state.agentStore.findSession(idOrName)
+  if found.isNone:
+    printError(&"Session not found: \"{idOrName}\".", theme)
+    return
+
+  let session = found.get
+  let isDeletingCurrent = session.sessionId == a.state.session.id
+
+  # Confirm deletion
+  echo $styled(&"  ⚠ Delete session \"{session.name}\" and all its messages? (y/N) ").fg(theme.errorLabel).style(bold)
+  stdout.flushFile()
+
+  let confirm = stdin.readLine().strip().toLowerAscii()
+  if confirm notin ["y", "yes"]:
+    printMeta("Deletion cancelled.", theme)
+    return
+
+  let ok = a.state.agentStore.deleteSession(session.sessionId, deleteMessages = true)
+  if ok:
+    printMeta(&"Session \"{session.name}\" deleted.", theme)
+
+    if isDeletingCurrent:
+      # Switch to a new session
+      sessionNew(a, state, "", theme, width)
+  else:
+    printError("Failed to delete session.", theme)
+
+proc processSessionCommand*(cmd: string, a: Agent, state: var ReplState, theme: ReplTheme, width: int): bool =
+  ## Process /session subcommands. Returns true if handled.
+  let parts = cmd.split(" ", maxsplit = 2)
+  # parts[0] = "/session"
+  let subCmd = if parts.len > 1: parts[1].strip().toLowerAscii() else: ""
+  let arg = if parts.len > 2: parts[2].strip() else: ""
+
+  case subCmd
+  of "", "info":
+    printSessionInfo(a, theme, width)
+    return true
+
+  of "list", "ls":
+    printSessionList(a, theme, width)
+    return true
+
+  of "new", "create":
+    sessionNew(a, state, arg, theme, width)
+    return true
+
+  of "switch", "sw", "use", "load":
+    if arg.len == 0:
+      printError("Usage: /session switch <id or name>", theme)
+    else:
+      sessionSwitch(a, state, arg, theme, width)
+    return true
+
+  of "rename", "mv":
+    sessionRename(a, arg, theme)
+    return true
+
+  of "delete", "rm", "del":
+    if arg.len == 0:
+      printError("Usage: /session delete <id or name>", theme)
+    else:
+      sessionDelete(a, state, arg, theme, width)
+    return true
+
+  else:
+    printError(&"Unknown session command: \"{subCmd}\". Try: list, new, switch, rename, delete", theme)
+    return true
+
+# =============================================================================
+# Dynamic Tool Commands
+# =============================================================================
+
+proc printToolsList*(state: ReplState, theme: ReplTheme, width: int, showSource: bool = false) =
+  ## Display list of all loaded tools.
+  if state.dynamicTools.isNil:
+    printError("Dynamic tools registry not initialized.", theme)
+    return
+  
+  let tools = state.dynamicTools.listLoaded()
+  
+  if tools.len == 0:
+    printMeta("No tools registered.", theme)
+    return
+  
+  echo ""
+  echo $styled("  Registered Tools").fg(theme.headerAccent).style(bold, underline)
+  thinDivider(width, theme.dividerColor)
+  
+  for info in tools:
+    let kindStr = case info.kind
+      of tskNimSource: "nim"
+      of tskCompiledExe: "exe"
+      of tskJsonWrapper: "json"
+    
+    let builtInTag = if info.isBuiltIn: $styled(" [built-in]").fg(theme.toolLabel).style(dim) else: ""
+    let kindTag = $styled(&" ({kindStr})").fg(theme.statText).style(dim)
+    
+    echo $styled("    • ").fg(theme.metaText) &
+         $styled(info.name).fg(theme.userText).style(bold) &
+         kindTag & builtInTag
+    
+    if showSource:
+      let sourceStr = if info.source.len > 0: info.source else: "(unknown)"
+      echo $styled(&"      source: {sourceStr}").fg(theme.metaText).style(dim)
+  
+  thinDivider(width, theme.dividerColor)
+  printMeta(&"Total: {tools.len} tools", theme)
+  echo ""
+
+proc processToolsCommand*(cmd: string, state: var ReplState, a: Agent, theme: ReplTheme, width: int): bool =
+  ## Process /tools subcommands. Returns true if handled.
+  let parts = cmd.splitWhitespace()
+  let subCmd = if parts.len > 1: parts[1].strip().toLowerAscii() else: ""
+  
+  # Handle flags like /tools list --source
+  var showSource = false
+  var actualSubCmd = subCmd
+  for i in 2 ..< parts.len:
+    if parts[i] == "--source":
+      showSource = true
+    elif actualSubCmd.len == 0:
+      actualSubCmd = parts[i]
+  
+  case actualSubCmd
+  of "", "list", "ls":
+    printToolsList(state, theme, width, showSource)
+    return true
+  
+  of "add", "load":
+    if parts.len < 3:
+      printError("Usage: /tools add <filepath.nim>", theme)
+      return true
+    
+    let filepath = parts[2]
+    if not fileExists(filepath):
+      # Try relative to tools directory
+      let altPath = state.dynamicTools.toolsDir / filepath
+      if fileExists(altPath):
+        try:
+          let loaded = state.dynamicTools.loadFromNimSource(altPath)
+          printMeta(&"Loaded {loaded.len} tool(s) from {altPath}:", theme)
+          for name in loaded:
+            echo $styled(&"    + {name}").fg(theme.assistantLabel)
+        except CatchableError as ex:
+          printError(&"Failed to load {altPath}: {ex.msg}", theme)
+      else:
+        printError(&"File not found: {filepath}", theme)
+    else:
+      try:
+        let loaded = state.dynamicTools.loadFromNimSource(filepath)
+        printMeta(&"Loaded {loaded.len} tool(s) from {filepath}:", theme)
+        for name in loaded:
+          echo $styled(&"    + {name}").fg(theme.assistantLabel)
+      except CatchableError as ex:
+        printError(&"Failed to load {filepath}: {ex.msg}", theme)
+    return true
+  
+  of "remove", "rm", "del", "unload":
+    if parts.len < 3:
+      printError("Usage: /tools remove <toolName>", theme)
+      return true
+    
+    let toolName = parts[2]
+    try:
+      if state.dynamicTools.unloadTool(toolName):
+        printMeta(&"Removed tool: {toolName}", theme)
+      else:
+        printError(&"Tool not found: {toolName}", theme)
+    except CatchableError as ex:
+      printError(ex.msg, theme)
+    return true
+  
+  of "reload":
+    if parts.len < 3:
+      printError("Usage: /tools reload <toolName>  or  /tools reload --all", theme)
+      return true
+    
+    let arg = parts[2]
+    if arg == "--all":
+      let (success, failed) = state.dynamicTools.reloadAll()
+      printMeta(&"Reloaded {success} tools, {failed} failed", theme)
+    else:
+      try:
+        if state.dynamicTools.reloadTool(arg):
+          printMeta(&"Reloaded tool: {arg}", theme)
+        else:
+          printError(&"Failed to reload: {arg}", theme)
+      except CatchableError as ex:
+        printError(ex.msg, theme)
+    return true
+  
+  of "create", "new", "init":
+    if parts.len < 3:
+      printError("Usage: /tools create <toolName>", theme)
+      return true
+    
+    let toolName = parts[2]
+    try:
+      let path = state.dynamicTools.createToolSkeleton(toolName)
+      printMeta(&"Created tool skeleton: {path}", theme)
+      echo $styled("    Edit the file and run: /tools add " & path.splitFile.name & ".nim").fg(theme.metaText)
+    except CatchableError as ex:
+      printError(ex.msg, theme)
+    return true
+  
+  of "scan", "discover":
+    let files = state.dynamicTools.scanToolDirectory()
+    if files.len == 0:
+      printMeta("No tool files found in tools directory.", theme)
+    else:
+      printMeta(&"Found {files.len} tool file(s):", theme)
+      for f in files:
+        let filename = f.extractFilename
+        let alreadyLoaded = state.dynamicTools.isLoaded(filename.splitFile.name)
+        let status = if alreadyLoaded: $styled(" [loaded]").fg(theme.assistantLabel) else: ""
+        echo $styled(&"    • {filename}{status}").fg(theme.metaText)
+    return true
+  
+  else:
+    printError(&"Unknown /tools command: '{actualSubCmd}'. Try: list, add, remove, reload, create, scan", theme)
+    return true
+
+# =============================================================================
+# KV Store Commands
+# =============================================================================
+
+proc printKVHelp*(theme: ReplTheme, width: int) =
+  ## Print detailed help for the /kv command.
+  echo ""
+  echo $styled("  KV Store - Store and retrieve key-value pairs").fg(theme.headerAccent).style(bold, underline)
+  echo ""
+  echo $styled("  Usage:").fg(theme.userLabel).style(bold)
+  echo ""
+  
+  let examples = @[
+    ("/kv",                       "List all keys with truncated values (100 char limit)"),
+    ("/kv --help",                "Show this help message"),
+    ("/kv --key mykey --value myvalue",  "Store a simple value"),
+    ("/kv --key mykey --value hello world",  "Store value with spaces (no quotes needed)"),
+    ("/kv add",                   "Interactive mode - prompts for key then multi-line value"),
+    ("/kv get mykey",             "Get the full value for a key"),
+    ("/kv delete mykey",          "Delete a specific key"),
+    ("/kv clear",                 "Delete all keys"),
+  ]
+  
+  for (cmd, desc) in examples:
+    let padded = cmd & " ".repeat(max(1, 36 - cmd.len))
+    echo $styled("    ").fg(theme.metaText) &
+         $styled(padded).fg(cyan).style(bold) &
+         $styled(desc).fg(theme.metaText)
+  
+  echo ""
+  echo $styled("  Notes:").fg(theme.userLabel).style(bold)
+  echo $styled("    • Keys are case-sensitive").fg(theme.metaText)
+  echo $styled("    • Values can be multi-line in interactive mode").fg(theme.metaText)
+  echo $styled("    • Values are truncated to 100 chars when listing").fg(theme.metaText)
+  echo $styled("    • Storage is in-memory only (lost on restart)").fg(theme.metaText)
+  echo ""
+
+proc truncateValue(value: string; maxLen: int = 100): string =
+  ## Truncate value for display, adding ellipsis if needed.
+  let clean = value.replace("\n", " ↵ ")
+  if clean.len <= maxLen:
+    return clean
+  return clean[0..<maxLen] & "…"
+
+proc listKV*(state: ReplState, theme: ReplTheme, width: int) =
+  ## List all key-value pairs in a table format.
+  if state.kvStore.len == 0:
+    printMeta("No keys stored. Use /kv --key <key> --value <val> to add one.", theme)
+    return
+  
+  echo ""
+  echo $styled("  Stored Keys").fg(theme.headerAccent).style(bold, underline)
+  echo ""
+  
+  # Build table rows
+  var rows: seq[seq[string]] = @[]
+  var sortedKeys: seq[string] = @[]
+  
+  for key in state.kvStore.keys:
+    sortedKeys.add(key)
+  sortedKeys.sort()
+  
+  for key in sortedKeys:
+    let value = state.kvStore[key]
+    rows.add(@[key, truncateValue(value)])
+  
+  # Use nimsterm's simpleTable for clean display
+  let headers = @["Key", "Value (truncated)"]
+  echo simpleTable(headers, rows)
+  echo ""
+  printMeta(&"Total: {state.kvStore.len} key(s)", theme)
+
+proc getKV*(state: ReplState, key: string, theme: ReplTheme) =
+  ## Get full value for a specific key.
+  if not state.kvStore.hasKey(key):
+    printError(&"Key not found: '{key}'", theme)
+    return
+  
+  echo ""
+  echo $styled(&"  Key: ").fg(theme.metaText) &
+       $styled(key).fg(theme.userText).style(bold)
+  echo $styled("  Value:").fg(theme.metaText)
+  echo ""
+  
+  let value = state.kvStore[key]
+  for line in value.split('\n'):
+    echo $styled("    " & line).fg(theme.userText)
+  echo ""
+  let lineCount = value.count('\n')
+  printMeta(&"{value.len} characters, {lineCount} line(s)", theme)
+
+proc deleteKV*(state: var ReplState, key: string, theme: ReplTheme) =
+  ## Delete a specific key.
+  if not state.kvStore.hasKey(key):
+    printError(&"Key not found: '{key}'", theme)
+    return
+  
+  state.kvStore.del(key)
+  printMeta(&"Deleted key: '{key}'", theme)
+
+proc clearKV*(state: var ReplState, theme: ReplTheme) =
+  ## Clear all keys.
+  if state.kvStore.len == 0:
+    printMeta("No keys to clear.", theme)
+    return
+  
+  let count = state.kvStore.len
+  state.kvStore.clear()
+  printMeta(&"Cleared {count} key(s)", theme)
+
+proc interactiveKVAdd*(state: var ReplState, theme: ReplTheme) =
+  ## Interactive mode: prompt for key, then multi-line value.
+  echo ""
+  echo $styled("  📋 Interactive KV Add Mode").fg(theme.headerAccent).style(bold)
+  echo $styled("     Enter key (single line):").fg(theme.metaText)
+  stdout.write $styled("  key ❯ ").fg(theme.promptArrow).style(bold)
+  stdout.flushFile()
+  
+  let key = stdin.readLine().strip()
+  if key.len == 0:
+    printError("Key cannot be empty.", theme)
+    return
+  
+  echo ""
+  echo $styled("     Enter value (end with /end on its own line):").fg(theme.metaText)
+  echo $styled("     ──────────────────────────────────────────").fg(theme.dividerColor)
+  
+  var lines: seq[string] = @[]
+  while true:
+    stdout.write $styled("  val ❯ ").fg(theme.promptArrow).style(dim)
+    stdout.flushFile()
+    let line = stdin.readLine()
+    if line.strip() == "/end":
+      break
+    lines.add(line)
+  
+  let value = lines.join("\n")
+  if value.len == 0:
+    printError("Value cannot be empty.", theme)
+    return
+  
+  state.kvStore[key] = value
+  echo $styled("     ──────────────────────────────────────────").fg(theme.dividerColor)
+  printMeta(&"Stored key '{key}' with {value.len} character(s)", theme)
+
+proc processKVCommand*(cmd: string, state: var ReplState, theme: ReplTheme, width: int): bool =
+  ## Process /kv subcommands. Returns true if handled.
+  let parts = cmd.splitWhitespace()
+  
+  # No args - list all keys
+  if parts.len == 1:
+    listKV(state, theme, width)
+    return true
+  
+  # Check for flags
+  var i = 1
+  var keyFlag = ""
+  var valueFlag = ""
+  var positionalArgs: seq[string] = @[]
+  
+  while i < parts.len:
+    let part = parts[i]
+    
+    if part == "--help" or part == "-h":
+      printKVHelp(theme, width)
+      return true
+    
+    elif part == "--key" or part == "-k":
+      if i + 1 >= parts.len:
+        printError("Missing value for --key flag", theme)
+        return true
+      keyFlag = parts[i + 1]
+      i += 2
+    
+    elif part == "--value" or part == "-v":
+      if i + 1 >= parts.len:
+        printError("Missing value for --value flag", theme)
+        return true
+      # Join all remaining parts as value
+      valueFlag = parts[i + 1..^1].join(" ")
+      break
+    
+    elif part.startsWith("-"):
+      # Unknown flag
+      printError(&"Unknown flag: {part}", theme)
+      return true
+    
+    else:
+      # Positional argument
+      positionalArgs.add(part)
+      i += 1
+  
+  # Handle --key and --value flags
+  if keyFlag.len > 0:
+    if valueFlag.len == 0:
+      printError("Missing --value flag. Usage: /kv --key <key> --value <value>", theme)
+      return true
+    state.kvStore[keyFlag] = valueFlag
+    printMeta(&"Stored key '{keyFlag}'", theme)
+    return true
+  
+  # Handle positional subcommands
+  if positionalArgs.len > 0:
+    let subCmd = positionalArgs[0].toLowerAscii()
+    
+    case subCmd
+    of "add":
+      interactiveKVAdd(state, theme)
+      return true
+    
+    of "get":
+      if positionalArgs.len < 2:
+        printError("Usage: /kv get <key>", theme)
+      else:
+        getKV(state, positionalArgs[1], theme)
+      return true
+    
+    of "delete", "del", "rm":
+      if positionalArgs.len < 2:
+        printError("Usage: /kv delete <key>", theme)
+      else:
+        deleteKV(state, positionalArgs[1], theme)
+      return true
+    
+    of "clear":
+      clearKV(state, theme)
+      return true
+    
+    of "help":
+      printKVHelp(theme, width)
+      return true
+    
+    else:
+      # If it looks like a key (no spaces, not a command), treat as get
+      if positionalArgs.len == 1 and subCmd.len > 0:
+        getKV(state, subCmd, theme)
+      else:
+        printError(&"Unknown /kv command: '{subCmd}'. Try /kv --help", theme)
+      return true
+  
+  # Default: list all
+  listKV(state, theme, width)
+  return true
+
+# =============================================================================
+# Job scheduling helpers
+# =============================================================================
+
+proc formatDelay(secs: int64): string =
+  if secs >= 86400 and secs mod 86400 == 0: return &"{secs div 86400} days"
+  if secs >= 3600 and secs mod 3600 == 0: return &"{secs div 3600} hours"
+  if secs >= 60 and secs mod 60 == 0: return &"{secs div 60} minutes"
+  return &"{secs} seconds"
+
+proc formatRecurring(interval: string): string =
+  return &"recurring {interval}"
+
+proc tryParseDelaySchedule(input: string): Option[jobtypes.ScheduleSpec] =
+  ## Very small built-in parser for:
+  ##   - "in N minutes <task>" / "after N minutes <task>" (one-shot delay)
+  ##   - "every N minutes <task>" (recurring cron)
+  let s = input.strip()
+  let low = s.toLowerAscii()
+  
+  # Handle "in " and "after " patterns (one-shot delay)
+  if low.startsWith("in ") or low.startsWith("after "):
+    let rest = if low.startsWith("in "): s[3..^1].strip() else: s[6..^1].strip()
+    let parts = rest.splitWhitespace()
+    if parts.len < 3: return none(jobtypes.ScheduleSpec)
+
+    var n: int
+    try:
+      n = parseInt(parts[0])
+    except:
+      return none(jobtypes.ScheduleSpec)
+
+    let unit = parts[1].toLowerAscii()
+    var secs: int64
+    if unit.startsWith("sec"): secs = n.int64
+    elif unit.startsWith("min"): secs = (n * 60).int64
+    elif unit.startsWith("hour") or unit in ["hr", "hrs"]: secs = (n * 3600).int64
+    elif unit.startsWith("day"): secs = (n * 86400).int64
+    else: return none(jobtypes.ScheduleSpec)
+
+    let task = parts[2..^1].join(" ").strip()
+    if task.len == 0: return none(jobtypes.ScheduleSpec)
+
+    return some(jobtypes.ScheduleSpec(
+      kind: jobtypes.skDelay,
+      cronExpr: "",
+      delaySeconds: secs,
+      recurring: false,
+      taskPrompt: task,
+      rawInput: s
+    ))
+  
+  # Handle "every " pattern (recurring cron)
+  elif low.startsWith("every "):
+    let rest = s[6..^1].strip()  # Skip "every "
+    let parts = rest.splitWhitespace()
+    if parts.len < 3: return none(jobtypes.ScheduleSpec)
+
+    var n: int
+    try:
+      n = parseInt(parts[0])
+    except:
+      return none(jobtypes.ScheduleSpec)
+
+    let unit = parts[1].toLowerAscii()
+    var cronExpr: string
+    
+    # Build cron expression based on unit
+    if unit.startsWith("min"):
+      # Every N minutes: */N * * * *
+      cronExpr = &"*/{n} * * * *"
+    elif unit.startsWith("hour") or unit in ["hr", "hrs"]:
+      # Every N hours: 0 */N * * *
+      cronExpr = &"0 */{n} * * *"
+    elif unit.startsWith("day"):
+      # Every N days: 0 0 */N * *
+      cronExpr = &"0 0 */{n} * *"
+    else:
+      return none(jobtypes.ScheduleSpec)
+
+    let task = parts[2..^1].join(" ").strip()
+    if task.len == 0: return none(jobtypes.ScheduleSpec)
+
+    return some(jobtypes.ScheduleSpec(
+      kind: jobtypes.skCron,
+      cronExpr: cronExpr,
+      delaySeconds: 0,
+      recurring: true,
+      taskPrompt: task,
+      rawInput: s
+    ))
+  
+  else:
+    return none(jobtypes.ScheduleSpec)
+
+proc jobShortId(uid: string): string =
+  if uid.len > 8: uid[0..7] else: uid
+
+proc attachJobHandlers(job: Job, agentName: string, theme: ReplTheme) =
+  ## Print job lifecycle events into the REPL as they happen.
+  ## NOTE: This is intentionally lightweight (one-liners + small preview).
+  if job.isNil: return
+
+  job.onStarting:
+    printMeta(&"Job {jobShortId(e.jobId)} starting (run {e.runNumber})", theme)
+
+  job.onCompleted:
+    printMeta(&"Job {jobShortId(e.jobId)} completed ({e.elapsedMs}ms, {e.tokensUsed} tokens).", theme)
+    if e.resultText.len > 0:
+      let flat = e.resultText.replace("\n", " ").replace("\r", "")
+      let preview = if flat.len > 140: flat[0..139] & "…" else: flat
+      echo $styled("    " & preview).fg(theme.metaText).style(dim)
+      echo ""
+
+  job.onFailed:
+    printError(&"Job {jobShortId(e.jobId)} failed: {e.errorMessage}", theme)
+
+  job.onCancelled:
+    printMeta(&"Job {jobShortId(e.jobId)} cancelled.", theme)
+
+  job.onPaused:
+    printMeta(&"Job {jobShortId(e.jobId)} paused.", theme)
+
+  job.onResumed:
+    printMeta(&"Job {jobShortId(e.jobId)} resumed.", theme)
 # =============================================================================
 # Input Handling (reused from tick.nim patterns)
 # =============================================================================
@@ -959,6 +1621,7 @@ const
 
 when defined(windows):
   proc kbhit(): cint {.importc: "_kbhit", header: "<conio.h>".}
+  proc getch(): cint {.importc: "_getch", header: "<conio.h>".}
 
   proc replReadPasteAware*(timeoutMs: int = 50): string =
     result = stdin.readLine()
@@ -1002,20 +1665,44 @@ proc replReadBlock(): string =
   return line
 
 proc readUserInput(): string =
-  ## Try bracketed paste first, fall back to paste-aware reader.
-  result = replReadBlock()
-  if result.len == 0:
-    result = replReadPasteAware()
+  ## Read a line while pumping asyncdispatch.poll() so background jobs keep running.
+  when defined(windows):
+    var buf = ""
+    while true:
+      asyncdispatch.poll(50)
+      if kbhit() != 0:
+        let ch = getch().int
+        case ch
+        of 13, 10:
+          echo ""
+          return buf
+        of 8:
+          if buf.len > 0:
+            buf.setLen(buf.len - 1)
+            stdout.write "\b \b"
+            stdout.flushFile()
+        else:
+          if ch >= 32:
+            let c = chr(ch)
+            buf.add c
+            stdout.write $c
+            stdout.flushFile()
+  else:
+    let sel = newSelector[int]()
+    sel.registerHandle(stdin.getFileHandle().int, {Read}, 0)
+    defer: sel.close()
+    while true:
+      asyncdispatch.poll(0)
+      let ready = sel.select(50)
+      asyncdispatch.poll(0)
+      if ready.len > 0:
+        return replReadBlock()
 
 # =============================================================================
 # Prompt
 # =============================================================================
 
 proc showPrompt*(theme: ReplTheme, lastExitCode: int = 0) =
-  ## Show the input prompt with shell context line above the arrow.
-  ## Format:
-  ##   user@host ~/path [exitcode] @#
-  ##   ❯ _
   echo "  " & shellPrompt(theme, lastExitCode)
   stdout.write $styled("  ❯ ").fg(theme.promptArrow).style(bold)
   stdout.flushFile()
@@ -1025,7 +1712,6 @@ proc showPrompt*(theme: ReplTheme, lastExitCode: int = 0) =
 # =============================================================================
 
 proc replWaitForTurn*(a: Agent, fut: Future[TickResult], theme: ReplTheme): TickResult =
-  ## Wait for a chatTurn to complete, showing a spinner/indicator.
   when defined(llmm_repl_termui):
     let spinner = termuiSpinner(&"{a.cfg.name} is thinking...")
     while not fut.finished:
@@ -1037,7 +1723,6 @@ proc replWaitForTurn*(a: Agent, fut: Future[TickResult], theme: ReplTheme): Tick
       spinner.complete("Done")
     return res
   else:
-    # Simple animated dots fallback
     stdout.write $styled(&"{a.cfg.name} is thinking").fg(theme.metaText).style(dim)
     stdout.flushFile()
     var dots = 0
@@ -1048,7 +1733,6 @@ proc replWaitForTurn*(a: Agent, fut: Future[TickResult], theme: ReplTheme): Tick
       stdout.write $styled(&"{a.cfg.name} is thinking" & ".".repeat(dots) & " ".repeat(3 - dots)).fg(theme.metaText).style(dim)
       stdout.flushFile()
 
-    # Clear the thinking line
     stdout.write "\r"
     stdout.eraseLine()
     stdout.flushFile()
@@ -1059,13 +1743,9 @@ proc replWaitForTurn*(a: Agent, fut: Future[TickResult], theme: ReplTheme): Tick
 # =============================================================================
 
 proc displayTickResult*(res: TickResult, agentName: string, state: var ReplState) =
-  ## Process and display a TickResult with full event visibility.
-  ## NOTE: chatTurn() already persists to SQLite — we only update in-memory
-  ## state and display here.
   let theme = state.settings.theme
   let width = state.settings.getContentWidth()
 
-  # Show tool calls in debug mode
   if state.settings.showDebug and res.toolCalls.len > 0:
     echo ""
     echo $styled("    ── Tools ──").fg(theme.toolLabel).style(dim)
@@ -1081,7 +1761,6 @@ proc displayTickResult*(res: TickResult, agentName: string, state: var ReplState
     echo $styled("    ───────────").fg(theme.toolLabel).style(dim)
     echo ""
 
-  # Show assistant response
   if res.error.isSome:
     printError(res.error.get(), theme)
     state.history.add ReplMessage(
@@ -1096,14 +1775,14 @@ proc displayTickResult*(res: TickResult, agentName: string, state: var ReplState
     )
     state.history.add ReplMessage(
       role: "assistant", name: agentName, text: res.text,
-      timestamp: now(), tokens: res.tokensUsed, elapsed: res.elapsed
+      timestamp: now(), tokens: res.tokensUsed, elapsed : res.elapsed
     )
 
 # =============================================================================
 # Config Display
 # =============================================================================
 
-proc printCfg*(cfg: AgentConfig, state: ReplState) =
+proc printCfg*(cfg: AgentConfig, state: ReplState, sessionName: string = "", sessionId: string = "") =
   ## Print current agent + REPL configuration.
   let theme = state.settings.theme
   let width = state.settings.getContentWidth()
@@ -1132,6 +1811,19 @@ proc printCfg*(cfg: AgentConfig, state: ReplState) =
   toolNames.sort()
   kv("tools", if toolNames.len > 0: toolNames.join(", ") else: "(none)")
   kv("toolCount", $toolNames.len)
+  
+  # Show dynamic tools info if available
+  if not state.dynamicTools.isNil:
+    let loaded = state.dynamicTools.listLoaded()
+    let dynamicCount = loaded.filterIt(not it.isBuiltIn).len
+    if dynamicCount > 0:
+      kv("dynamicTools", $dynamicCount)
+  
+  echo ""
+
+  echo $styled("  Session").fg(theme.assistantLabel).style(bold)
+  if sessionId.len > 0: kv("sessionId", sessionId)
+  if sessionName.len > 0: kv("sessionName", sessionName)
   echo ""
 
   echo $styled("  Policy").fg(theme.assistantLabel).style(bold)
@@ -1163,6 +1855,9 @@ proc printCfg*(cfg: AgentConfig, state: ReplState) =
   kv("maxWidth", $state.settings.maxWidth)
   kv("loadHistory", $state.settings.loadHistory)
   kv("maxHistoryLoad", $state.settings.maxHistoryLoad)
+  
+  if not state.dynamicTools.isNil:
+    kv("toolsDir", state.dynamicTools.toolsDir)
 
   thinDivider(width, theme.dividerColor)
   echo ""
@@ -1171,7 +1866,9 @@ proc printCfg*(cfg: AgentConfig, state: ReplState) =
 # Command Processing (slash prefix)
 # =============================================================================
 
-proc processCommand*(cmd: string, state: var ReplState, agentName: string, agentStore: AgentStore = nil): bool =
+proc processCommand*(cmd: string, state: var ReplState, agentName: string,
+                     agentStore: AgentStore = nil, agent: Agent = nil,
+                     sched: AgentScheduler = nil): bool =
   ## Process a REPL slash command. Returns true if the command was handled.
   let parts = cmd.split(" ", maxsplit = 1)
   let command = parts[0].toLowerAscii()
@@ -1267,6 +1964,100 @@ proc processCommand*(cmd: string, state: var ReplState, agentName: string, agent
       printMeta(&"Max width set to: {state.settings.getContentWidth()}", theme)
     return true
 
+  of "/jobs":
+    if sched.isNil:
+      printError("Job scheduler not initialized.", theme)
+    else:
+      let rows = sched.jobStore.getAllJobs(sched.agentId, limit = 200)
+      if rows.len == 0:
+        printMeta("No jobs.", theme)
+      else:
+        printMeta(&"Jobs ({rows.len}):", theme)
+        for row in rows:
+          var nextAt = if row.nextRunAt.len > 0: row.nextRunAt else: "(none)"
+          var lastAt = if row.lastRunAt.len > 0: row.lastRunAt else: "(never)"
+          if nextAt.len > 19 and nextAt != "(none)": nextAt = nextAt[0..18]
+          if lastAt.len > 19 and lastAt != "(never)": lastAt = lastAt[0..18]
+
+          let task = if row.taskPrompt.len > 70: row.taskPrompt[0..69] & "…" else: row.taskPrompt
+          let err  = if row.lastError.len > 0:
+                        (if row.lastError.len > 80: row.lastError[0..79] & "…" else: row.lastError)
+                     else: ""
+
+          echo $styled(&"    {row.uid}  {row.status}/{row.scheduleKind}  runs: {row.runCount}").fg(theme.metaText).style(dim)
+          echo $styled(&"      next: {nextAt}   last: {lastAt}").fg(theme.metaText).style(dim)
+          echo $styled(&"      task: {task}").fg(theme.metaText)
+          if err.len > 0:
+            echo $styled(&"      err : {err}").fg(theme.errorText).style(dim)
+          echo ""
+    return true
+
+  of "/job":
+    if sched.isNil:
+      printError("Job scheduler not initialized.", theme)
+      return true
+
+    let p = arg.splitWhitespace()
+    if p.len < 2:
+      printError("Usage: /job cancel|pause|resume|info <uid>", theme)
+      return true
+
+    let action = p[0].toLowerAscii()
+    let uid = p[1]
+
+    case action
+    of "cancel", "c", "rm", "del":
+      sched.cancelJob(uid)
+      printMeta(&"Cancel requested for job {uid}", theme)
+
+    of "pause", "p":
+      sched.pauseJob(uid)
+      printMeta(&"Pause requested for job {uid}", theme)
+
+    of "resume", "r":
+      sched.resumeJob(uid)
+      printMeta(&"Resume requested for job {uid}", theme)
+
+    of "info", "show":
+      let opt = sched.jobStore.getByUid(uid)
+      if opt.isNone:
+        printError(&"Job not found: {uid}", theme)
+      else:
+        let row = opt.get
+        printMeta(&"Job {row.uid}:", theme)
+        echo $styled(&"    status      : {row.status}").fg(theme.metaText).style(dim)
+        echo $styled(&"    kind        : {row.scheduleKind}").fg(theme.metaText).style(dim)
+        echo $styled(&"    created     : {row.createdAt}").fg(theme.metaText).style(dim)
+        echo $styled(&"    lastRunAt   : {row.lastRunAt}").fg(theme.metaText).style(dim)
+        echo $styled(&"    nextRunAt   : {row.nextRunAt}").fg(theme.metaText).style(dim)
+        echo $styled(&"    runCount    : {row.runCount}").fg(theme.metaText).style(dim)
+        if row.lastError.len > 0:
+          echo $styled(&"    lastError   : {row.lastError}").fg(theme.errorText).style(dim)
+        echo $styled(&"    task        : {row.taskPrompt}").fg(theme.metaText)
+        echo ""
+
+    else:
+      printError(&"Unknown /job action: {action}. Try: cancel, pause, resume, info", theme)
+
+    return true
+
+  of "/session":
+    if not agent.isNil:
+      return processSessionCommand(cmd, agent, state, theme, width)
+    else:
+      printError("Session management not available (agent reference missing).", theme)
+      return true
+  
+  of "/tools":
+    if not agent.isNil:
+      return processToolsCommand(cmd, state, agent, theme, width)
+    else:
+      printError("Tool management not available (agent reference missing).", theme)
+      return true
+  
+  of "/kv":
+    return processKVCommand(cmd, state, theme, width)
+
   else:
     # Handle /! shorthand — interactive mode (full terminal handover)
     if command.startsWith("/!"):
@@ -1278,7 +2069,7 @@ proc processCommand*(cmd: string, state: var ReplState, agentName: string, agent
     return false  # Not a recognized command
 
 # =============================================================================
-# Main Chat REPL (upgraded with SQLite support + slash commands)
+# Main Chat REPL (upgraded with SQLite support + slash commands + sessions)
 # =============================================================================
 
 proc chatRepl*(a: Agent, firstMsg: string = "", settings: ReplSettings = defaultSettings()) =
@@ -1286,6 +2077,8 @@ proc chatRepl*(a: Agent, firstMsg: string = "", settings: ReplSettings = default
   ##
   ## Features:
   ##   - SQLite-backed chat history (loads prior sessions, persists via chatTurn)
+  ##   - Session management (/session new, list, switch, rename, delete)
+  ##   - Dynamic tool loading (/tools add, remove, reload, create)
   ##   - Styled message display with word wrapping
   ##   - Tool call visibility (toggle with /debug)
   ##   - Token/time stats (toggle with /stats)
@@ -1304,12 +2097,43 @@ proc chatRepl*(a: Agent, firstMsg: string = "", settings: ReplSettings = default
   # Grab the AgentStore handle for DB operations
   let agentStore = a.state.agentStore
 
+  # Job scheduler (runs via asyncdispatch.poll in the input loop)
+  var sched: AgentScheduler = nil
+  try:
+    sched = initScheduler(a)
+    asyncCheck sched.startScheduler()
+    for j in scheduler.listJobs(sched):
+      attachJobHandlers(j, a.cfg.name, theme)
+  except CatchableError as ex:
+    sched = nil
+    printError(&"Job scheduler init failed: {ex.msg}", theme)
+
+  # Register the schedule tool so LLM can use it for complex scheduling
+  if not sched.isNil:
+    if a.cfg.knowledgeConfig.client.isNil:
+      icy "ScheduleTool not registered - no OpenAI client configured in knowledgeConfig"
+    else:
+      a.addTools ScheduleTool(sched, a.cfg.knowledgeConfig.client)
+
+  # Initialize dynamic tool registry
+  state.dynamicTools = initDynamicTools(a, a.cfg.workspaceDir, hotReload = false)
+  
+  # Auto-load tools from workspace/tools/ directory
+  let (loadedCount, loadErrors) = state.dynamicTools.autoLoadTools()
+  if loadedCount > 0:
+    printMeta(&"Auto-loaded {loadedCount} dynamic tool(s)", theme)
+  for err in loadErrors:
+    printError(&"Tool load error: {err}", theme)
+
   # Print header
   printHeader(a.cfg.name, theme, width)
 
-  # Load prior chat history from SQLite if enabled
+  # Show current session info
+  printMeta(&"Session: \"{a.state.session.name}\" ({a.state.session.id})", theme)
+
+  # Load prior chat history from SQLite for this session if enabled
   if state.settings.loadHistory and not agentStore.isNil:
-    state.loadHistoryFromDb(agentStore, a.cfg.name, theme, width)
+    state.loadHistoryFromDb(agentStore, a.cfg.name, theme, width, a.state.session.id)
 
   replEnableBracketedPaste()
   defer: replDisableBracketedPaste()
@@ -1321,7 +2145,6 @@ proc chatRepl*(a: Agent, firstMsg: string = "", settings: ReplSettings = default
       role: "user", text: firstMsg, timestamp: now()
     )
 
-    # chatTurn() persists user + assistant messages to SQLite
     let fut = a.chatTurn(firstMsg)
     let res = replWaitForTurn(a, fut, theme)
     displayTickResult(res, a.cfg.name, state)
@@ -1356,10 +2179,10 @@ proc chatRepl*(a: Agent, firstMsg: string = "", settings: ReplSettings = default
     # Slash commands
     if cmd.startsWith("/"):
       if low == "/cfg":
-        printCfg(a.cfg, state)
+        printCfg(a.cfg, state, a.state.session.name, a.state.session.id)
         continue
 
-      if processCommand(cmd, state, a.cfg.name, agentStore):
+      if processCommand(cmd, state, a.cfg.name, agentStore, a, sched):
         continue
 
       # Handle /paste specially
@@ -1397,6 +2220,27 @@ proc chatRepl*(a: Agent, firstMsg: string = "", settings: ReplSettings = default
       role: "user", text: userMsg, timestamp: now()
     )
 
+    # Scheduling shortcuts: "in 2 minutes <task>" or "every 2 minutes <task>"
+    if not sched.isNil:
+      let specOpt = tryParseDelaySchedule(userMsg)
+      if specOpt.isSome:
+        let spec = specOpt.get
+        let job = sched.scheduleSpec(spec, scheduleDesc = userMsg)
+        attachJobHandlers(job, a.cfg.name, theme)
+        
+        # Generate appropriate response based on schedule type
+        let reply = if spec.recurring:
+          &"OK — I'll do that {formatRecurring(spec.cronExpr)}. (job {job.uid})"
+        else:
+          &"OK — I'll do that in {formatDelay(spec.delaySeconds)}. (job {job.uid})"
+        
+        printAssistantMessage(a.cfg.name, reply, theme, width, ts = now(),
+                            showTs = state.settings.showTimestamp,
+                            tokens = 0, elapsed = DurationZero,
+                            showStats = false)
+        state.history.add ReplMessage(role: "assistant", name: a.cfg.name, text: reply, timestamp: now())
+        continue
+
     # Execute chat turn — chatTurn() handles all SQLite persistence
     let fut = a.chatTurn(userMsg)
     let res = replWaitForTurn(a, fut, theme)
@@ -1423,9 +2267,8 @@ Treat everything in this session as important context to remember for future int
 
   var settings = defaultSettings()
   settings.showStats = true
-  settings.showDebug = true  # Show memory tool calls during feedback
+  settings.showDebug = true
 
-  # Override the header briefly
   echo ""
   echo $styled("  📝 Feedback Session").fg(yellow).style(bold)
   echo $styled("     Everything you say will be prioritized for memory storage.").fg(brightBlack).style(dim)

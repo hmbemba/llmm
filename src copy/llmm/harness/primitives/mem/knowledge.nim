@@ -30,7 +30,6 @@ import std/[
 ]
 
 import debby/sqlite
-import db_connector/sqlite3 as csqlite3   # <-- Nim 2.x: wrapper lives in db_connector, not std/wrappers :contentReference[oaicite:5]{index=5}
 import ic
 import ../../../debby_utils
 import ../../../embeddings
@@ -82,7 +81,7 @@ type
         dipReplace      ## delete existing doc (latest) and re-ingest
         dipVersion      ## keep existing and insert a new doc version
 
-    KnowledgeConfig* = object
+    KnowledgeConfig*           = object
         maxChunkChars*         = 1200
         chunkOverlap*          = 150
         chunkerKind*           = ckCharBased
@@ -125,20 +124,54 @@ else:
 type PSqlite3* = pointer
 
 const
-  SQLITE_OK* = 0
-  SQLITE_DBCONFIG_ENABLE_LOAD_EXTENSION* = 1005  # :contentReference[oaicite:3]{index=3}
+  SQLITE_OK*   = 0'i32
+  SQLITE_ROW*  = 100'i32
+  SQLITE_DONE* = 101'i32
 
+  SQLITE_DBCONFIG_ENABLE_LOAD_EXTENSION* = 1005  # enable C-API load_extension only :contentReference[oaicite:3]{index=3}
+
+  # Tell SQLite to copy the memory now (safe with Nim strings)
+  SQLITE_TRANSIENT* = cast[pointer](-1)
+
+when not declared(sqlite3_bind_int):
+  proc sqlite3_bind_int*(stmt: Statement, index: int32, value: int32): int32
+    {.sqliteDyn, importc: "sqlite3_bind_int".}
+
+when not declared(sqlite3_bind_int64):
+  proc sqlite3_bind_int64*(stmt: Statement, index: int32, value: int64): int32
+    {.sqliteDyn, importc: "sqlite3_bind_int64".}
+
+when not declared(sqlite3_bind_blob):
+  proc sqlite3_bind_blob*(stmt: Statement, index: int32, value: pointer, n: int32, destructor: pointer): int32
+    {.sqliteDyn, importc: "sqlite3_bind_blob".}
+
+when not declared(sqlite3_column_int):
+  proc sqlite3_column_int*(stmt: Statement, iCol: int32): int32
+    {.sqliteDyn, importc: "sqlite3_column_int".}
+
+when not declared(sqlite3_column_double):
+  proc sqlite3_column_double*(stmt: Statement, iCol: int32): float64
+    {.sqliteDyn, importc: "sqlite3_column_double".}
+
+when not declared(sqlite3_column_text):
+  proc sqlite3_column_text*(stmt: Statement, iCol: int32): cstring
+    {.sqliteDyn, importc: "sqlite3_column_text".}
+
+# Extension loading bits (Debby doesn't expose these)
 proc sqlite3_db_config*(db: PSqlite3; op: cint): cint
   {.sqliteDyn, importc: "sqlite3_db_config", varargs.}
 
 proc sqlite3_load_extension*(db: PSqlite3; zFile, zProc: cstring; pzErrMsg: ptr cstring): cint
   {.sqliteDyn, importc: "sqlite3_load_extension".}
 
-proc sqlite3_errmsg*(db: PSqlite3): cstring
-  {.sqliteDyn, importc: "sqlite3_errmsg".}
+proc sqlite3_enable_load_extension*(db: PSqlite3; onoff: cint): cint
+  {.sqliteDyn, importc: "sqlite3_enable_load_extension".}
 
 proc sqlite3_free*(z: cstring)
   {.sqliteDyn, importc: "sqlite3_free".}
+
+proc sqlite3_errmsg*(db: PSqlite3): cstring
+  {.sqliteDyn, importc: "sqlite3_errmsg".}
 
 
 proc defaultKnowledgeConfig*(): KnowledgeConfig =
@@ -395,28 +428,39 @@ proc loadVectorExtension(ks: KnowledgeStore) =
   try:
     let h = cast[PSqlite3](ks.rawSqliteHandle())
 
-    # Enable extension loading for the C-API only (recommended). :contentReference[oaicite:4]{index=4}
+    # Prefer db_config: enables ONLY C-API load, keeps SQL load_extension() disabled (safer). :contentReference[oaicite:5]{index=5}
     var prev: cint = 0
-    let rcEnable = sqlite3_db_config(
+    var enabledViaDbConfig = false
+
+    let rcCfg = sqlite3_db_config(
       h,
       SQLITE_DBCONFIG_ENABLE_LOAD_EXTENSION.cint,
       1.cint,
       addr prev
     )
-    if rcEnable != SQLITE_OK:
-      icr "sqlite3_db_config(ENABLE_LOAD_EXTENSION,1) failed", rcEnable, $sqlite3_errmsg(h)
-      ks.vectorLoaded = false
-      return
 
-    # Always turn it back off right after loading.
+    if rcCfg == SQLITE_OK:
+      enabledViaDbConfig = true
+    else:
+      # Fallback for older builds / odd configs: enable_load_extension enables C-API + SQL function (we disable immediately after). :contentReference[oaicite:6]{index=6}
+      icy "sqlite3_db_config(ENABLE_LOAD_EXTENSION) failed; falling back to sqlite3_enable_load_extension", rcCfg, $sqlite3_errmsg(h)
+      let rcEn = sqlite3_enable_load_extension(h, 1.cint)
+      if rcEn != SQLITE_OK:
+        icr "sqlite3_enable_load_extension(1) failed", rcEn, $sqlite3_errmsg(h)
+        ks.vectorLoaded = false
+        return
+
     defer:
-      var ignored: cint = 0
-      discard sqlite3_db_config(
-        h,
-        SQLITE_DBCONFIG_ENABLE_LOAD_EXTENSION.cint,
-        0.cint,
-        addr ignored
-      )
+      if enabledViaDbConfig:
+        var ignored: cint = 0
+        discard sqlite3_db_config(
+          h,
+          SQLITE_DBCONFIG_ENABLE_LOAD_EXTENSION.cint,
+          0.cint,
+          addr ignored
+        )
+      else:
+        discard sqlite3_enable_load_extension(h, 0.cint)
 
     var errMsg: cstring = nil
     let rcLoad = sqlite3_load_extension(h, ks.vectorExtPath.cstring, nil, addr errMsg)
@@ -438,7 +482,6 @@ proc loadVectorExtension(ks: KnowledgeStore) =
   except CatchableError as e:
     icr "Failed to load sqlite-vector (exception)", e.msg
     ks.vectorLoaded = false
-
 
 proc initKnowledgeTables(ks: KnowledgeStore) =
     icb "Initializing knowledge tables"
@@ -605,6 +648,60 @@ proc maybeQuantize*(ks: KnowledgeStore) =
     except CatchableError as e:
         icr "vector_quantize/preload failed", e.msg
 
+
+proc insertChunkRaw(
+  ks            : KnowledgeStore
+  ,docId        : int
+  ,pageNo       : int
+  ,chunkIndex   : int
+  ,content      : string
+  ,metadataJson : string
+  ,embeddingBlob: string   # raw float32 bytes in a Nim string
+  ,embeddingDim : int
+  ,embeddingModel: string
+  ,createdAt    : int64
+) =
+  const sql = """
+    INSERT INTO knowledge_chunk
+      (document_id, page_no, chunk_index, content, metadata_json,
+       embedding, embedding_dim, embedding_model, created_at)
+    VALUES
+      (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9);
+  """
+
+  var stmt: Statement
+  if sqlite3_prepare_v2(ks.db, sql.cstring, (-1).int32, stmt, nil) != SQLITE_OK:
+    raise newException(ValueError, "SQLite prepare failed: " & $sqlite3_errmsg(cast[PSqlite3](ks.rawSqliteHandle())))
+
+  defer:
+    discard sqlite3_finalize(stmt)
+
+  template chk(rc: int32, what: string) =
+    if rc != SQLITE_OK:
+      raise newException(ValueError, what & ": " & $sqlite3_errmsg(cast[PSqlite3](ks.rawSqliteHandle())))
+
+  chk sqlite3_bind_int(stmt,  1, docId.int32),      "bind docId"
+  chk sqlite3_bind_int(stmt,  2, pageNo.int32),     "bind pageNo"
+  chk sqlite3_bind_int(stmt,  3, chunkIndex.int32), "bind chunkIndex"
+
+  chk sqlite3_bind_text(stmt, 4, content.cstring, content.len.int32, SQLITE_TRANSIENT), "bind content"
+  chk sqlite3_bind_text(stmt, 5, metadataJson.cstring, metadataJson.len.int32, SQLITE_TRANSIENT), "bind metadata"
+
+  if embeddingBlob.len == 0:
+    raise newException(ValueError, "embeddingBlob is empty")
+
+  let pEmb = cast[pointer](unsafeAddr embeddingBlob[0])
+  chk sqlite3_bind_blob(stmt, 6, pEmb, embeddingBlob.len.int32, SQLITE_TRANSIENT), "bind embedding blob"
+
+  chk sqlite3_bind_int(stmt,  7, embeddingDim.int32), "bind embeddingDim"
+  chk sqlite3_bind_text(stmt, 8, embeddingModel.cstring, embeddingModel.len.int32, SQLITE_TRANSIENT), "bind embeddingModel"
+  chk sqlite3_bind_int64(stmt, 9, createdAt), "bind createdAt"
+
+  let stepRc = sqlite3_step(stmt)
+  if stepRc != SQLITE_DONE:
+    raise newException(ValueError, "SQLite insert step failed: " & $sqlite3_errmsg(cast[PSqlite3](ks.rawSqliteHandle())))
+
+
 proc ingestChunks*(
     ks       : KnowledgeStore
     ,docId   : int
@@ -646,21 +743,23 @@ proc ingestChunks*(
                     &"Embedding dim mismatch: vec.len={vec.len}, expected={ks.embedder.dim} (idx {j})")
 
             let (pageNo, idx) = chunkMeta[i + j]
+
             let blobStr = toBlobString(vec)
 
-            var chunk = KnowledgeChunk(
-                documentId     : docId
-                ,pageNo        : pageNo
-                ,chunkIndex    : idx
-                ,content       : batchTexts[j]
-                ,metadataJson  : "{}"
-                ,embedding     : Bytes blobStr
-                ,embeddingDim  : vec.len
-                ,embeddingModel: embResult.model
-                ,createdAt     : epochTime().int64
+            ks.insertChunkRaw(
+            docId          = docId
+            ,pageNo        = pageNo
+            ,chunkIndex    = idx
+            ,content       = batchTexts[j]
+            ,metadataJson  = "{}"
+            ,embeddingBlob = blobStr
+            ,embeddingDim  = vec.len
+            ,embeddingModel= embResult.model
+            ,createdAt     = epochTime().int64
             )
-            ks.db.insert(chunk)
+
             total.inc
+
 
         ic "Stored batch", min(i + batchSize, allChunks.len), "/", allChunks.len
 
@@ -774,35 +873,72 @@ proc search*(
     let kScan      = kk * oversample
 
     let sql = """
-        SELECT c.id, c.document_id, c.page_no, c.chunk_index, c.content,
-               v.distance,
-               d.title, d.source_type, d.source_path
-        FROM vector_quantize_scan('knowledge_chunk', 'embedding', ?, ?) AS v
-        JOIN knowledge_chunk c ON c.id = v.rowid
-        JOIN knowledge_document d ON d.id = c.document_id
-        ORDER BY v.distance ASC
-        LIMIT ?;
+    SELECT c.id, c.document_id, c.page_no, c.chunk_index, c.content,
+            v.distance,
+            d.title, d.source_type, d.source_path
+    FROM vector_quantize_scan('knowledge_chunk', 'embedding', ?1, ?2) AS v
+    JOIN knowledge_chunk c ON c.id = v.rowid
+    JOIN knowledge_document d ON d.id = c.document_id
+    WHERE c.embedding_model = ?4 AND c.embedding_dim = ?5
+    ORDER BY v.distance ASC
+    LIMIT ?3;
     """
 
+
+    var stmt: Statement
+    if sqlite3_prepare_v2(ks.db, sql.cstring, sql.len.int32, stmt, nil) != SQLITE_OK:
+        raise newException(ValueError, "SQLite prepare failed: " & $sqlite3_errmsg(ks.db))
+
     try:
-        let rows = ks.db.query(sql, queryBlob, kScan, kk)
-        for row in rows:
-            result.add SearchResult(
-                chunkId     : row[0].parseInt
-                ,documentId : row[1].parseInt
-                ,pageNo     : row[2].parseInt
-                ,chunkIndex : row[3].parseInt
-                ,content    : row[4]
-                ,distance   : row[5].parseFloat
-                ,title      : row[6]
-                ,sourceType : row[7]
-                ,sourcePath : row[8]
-            )
+        # ?1 = query vector BLOB
+        if queryBlob.len > 0:
+            let p = cast[pointer](unsafeAddr queryBlob[0])
+            if sqlite3_bind_blob(stmt, 1, p, queryBlob.len.int32, nil) != SQLITE_OK:
+                raise newException(ValueError, "SQLite bind_blob failed: " & $sqlite3_errmsg(ks.db))
+        else:
+            raise newException(ValueError, "Query embedding blob is empty")
+
+        # ?2 = kScan INTEGER (oversample)
+        if sqlite3_bind_int(stmt, 2, kScan.int32) != SQLITE_OK:
+            raise newException(ValueError, "SQLite bind_int(kScan) failed: " & $sqlite3_errmsg(ks.db))
+
+        # ?3 = LIMIT kk INTEGER
+        if sqlite3_bind_int(stmt, 3, kk.int32) != SQLITE_OK:
+            raise newException(ValueError, "SQLite bind_int(limit) failed: " & $sqlite3_errmsg(ks.db))
+
+
+        # ?4 = model TEXT
+        if sqlite3_bind_text(stmt, 4, ks.embedder.model.cstring, ks.embedder.model.len.int32, SQLITE_TRANSIENT) != SQLITE_OK:
+            raise newException(ValueError, "SQLite bind_text(model) failed: " & $sqlite3_errmsg(ks.db))
+
+        # ?5 = dim INTEGER
+        if sqlite3_bind_int(stmt, 5, ks.embedder.dim.int32) != SQLITE_OK:
+            raise newException(ValueError, "SQLite bind_int(dim) failed: " & $sqlite3_errmsg(ks.db))
+
+
+        while true:
+            let rc = sqlite3_step(stmt)
+            if rc == SQLITE_ROW:
+                result.add SearchResult(
+                    chunkId     : sqlite3_column_int(stmt, 0).int
+                    ,documentId : sqlite3_column_int(stmt, 1).int
+                    ,pageNo     : sqlite3_column_int(stmt, 2).int
+                    ,chunkIndex : sqlite3_column_int(stmt, 3).int
+                    ,content    : $sqlite3_column_text(stmt, 4)
+                    ,distance   : sqlite3_column_double(stmt, 5).float
+                    ,title      : $sqlite3_column_text(stmt, 6)
+                    ,sourceType : $sqlite3_column_text(stmt, 7)
+                    ,sourcePath : $sqlite3_column_text(stmt, 8)
+                )
+            elif rc == SQLITE_DONE:
+                break
+            else:
+                raise newException(ValueError, "SQLite step failed: " & $sqlite3_errmsg(ks.db))
+
         ic "search returning", result.len, "results"
-    except CatchableError as e:
-        icr "Vector search failed", e.msg
-        raise newException(ValueError,
-            "Vector search failed (is sqlite-vector loaded + quantized?): " & e.msg)
+    finally:
+        discard sqlite3_finalize(stmt)
+
 
 proc searchWithContext*(
     ks       : KnowledgeStore
