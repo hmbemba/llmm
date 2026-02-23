@@ -31,20 +31,20 @@ proc newOpenAIResponsesProvider*(client: OpenAIClient, name = "openai"): OpenAIR
 # Builders
 # -----------------------------------------------------------------------------
 
-method supportsBuiltInTools*(p: OpenAIResponsesProvider): bool = true
-method supportsMultimodal*(p: OpenAIResponsesProvider): bool = true
+method supportsBuiltInTools*(p: OpenAIResponsesProvider): bool {.gcsafe.} = true
+method supportsMultimodal*(p: OpenAIResponsesProvider): bool {.gcsafe.} = true
 
-method systemMessage*(p: OpenAIResponsesProvider, content: string): JsonNode =
+method systemMessage*(p: OpenAIResponsesProvider, content: string): JsonNode {.gcsafe.} =
   oai_builders.systemMessage(content)
 
-method assistantMessage*(p: OpenAIResponsesProvider, content: string): JsonNode =
+method assistantMessage*(p: OpenAIResponsesProvider, content: string): JsonNode {.gcsafe.} =
   oai_builders.assistantMessage(content)
 
-method userMessage*(p: OpenAIResponsesProvider, input: UserInput): JsonNode =
+method userMessage*(p: OpenAIResponsesProvider, input: UserInput): JsonNode {.gcsafe.} =
   ## Uses Responses-API compatible multimodal encoding.
   input.toUserMessage()
 
-method buildToolOutput*(p: OpenAIResponsesProvider, call: ToolCall, payload: JsonNode): JsonNode =
+method buildToolOutput*(p: OpenAIResponsesProvider, call: ToolCall, payload: JsonNode): JsonNode {.gcsafe.} =
   ## Responses API expects a function_call_output item.
   tool_base.functionOutput(call.callId, payload)
 
@@ -93,7 +93,7 @@ method startTurn*(
     tools: seq[JsonNode],
     instructions: string,
     previousTurnId: Option[string]
-  ): Future[tuple[state: TurnState, resp: ProviderResponse]] {.async.} =
+  ): Future[tuple[state: TurnState, resp: ProviderResponse]] {.async, gcsafe.} =
 
   var opts = CreateResponseOptions(
     model: model,
@@ -120,7 +120,7 @@ method continueTurn*(
     p: OpenAIResponsesProvider,
     state: TurnState,
     toolOutputs: seq[JsonNode]
-  ): Future[ProviderResponse] {.async.} =
+  ): Future[ProviderResponse] {.async, gcsafe.} =
 
   let st = OpenAIResponsesTurnState(state)
   if st.lastResponseId.isNone:
@@ -143,7 +143,7 @@ method reflection*(
     model: string,
     lastTurnId: string,
     memTool: tool_base.Tool
-  ): Future[void] {.async.} =
+  ): Future[void] {.async, gcsafe.} =
   ## A small, tool-only loop that lets the agent update its memory store.
   ## Uses Responses API chaining.
   var opts = CreateResponseOptions(

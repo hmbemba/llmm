@@ -71,25 +71,25 @@ proc `%`*(tc: ToolCall): JsonNode =
 # Provider interface
 # -----------------------------------------------------------------------------
 
-method supportsBuiltInTools*(p: LlmProvider): bool {.base.} =
+method supportsBuiltInTools*(p: LlmProvider): bool {.base, gcsafe.} =
   ## Built-in tools = non-function tools like web_search, file_search, etc.
   ## Default: false (most OpenAI-compatible chat providers only support function tools).
   false
 
-method supportsMultimodal*(p: LlmProvider): bool {.base.} =
+method supportsMultimodal*(p: LlmProvider): bool {.base, gcsafe.} =
   ## Whether `userMessage(UserInput)` can encode images/files.
   false
 
-method systemMessage*(p: LlmProvider, content: string): JsonNode {.base.} =
+method systemMessage*(p: LlmProvider, content: string): JsonNode {.base, gcsafe.} =
   raise newException(ValueError, "systemMessage not implemented for provider: " & p.name)
 
-method assistantMessage*(p: LlmProvider, content: string): JsonNode {.base.} =
+method assistantMessage*(p: LlmProvider, content: string): JsonNode {.base, gcsafe.} =
   raise newException(ValueError, "assistantMessage not implemented for provider: " & p.name)
 
-method userMessage*(p: LlmProvider, input: UserInput): JsonNode {.base.} =
+method userMessage*(p: LlmProvider, input: UserInput): JsonNode {.base, gcsafe.} =
   raise newException(ValueError, "userMessage not implemented for provider: " & p.name)
 
-method buildToolOutput*(p: LlmProvider, call: ToolCall, payload: JsonNode): JsonNode {.base.} =
+method buildToolOutput*(p: LlmProvider, call: ToolCall, payload: JsonNode): JsonNode {.base, gcsafe.} =
   ## Build the provider-specific message/item that returns tool output.
   raise newException(ValueError, "buildToolOutput not implemented for provider: " & p.name)
 
@@ -100,14 +100,14 @@ method startTurn*(
     tools: seq[JsonNode],
     instructions: string,
     previousTurnId: Option[string]
-  ): Future[tuple[state: TurnState, resp: ProviderResponse]] {.base, async.} =
+  ): Future[tuple[state: TurnState, resp: ProviderResponse]] {.base, async, gcsafe.} =
   raise newException(ValueError, "startTurn not implemented for provider: " & p.name)
 
 method continueTurn*(
     p: LlmProvider,
     state: TurnState,
     toolOutputs: seq[JsonNode]
-  ): Future[ProviderResponse] {.base, async.} =
+  ): Future[ProviderResponse] {.base, async, gcsafe.} =
   raise newException(ValueError, "continueTurn not implemented for provider: " & p.name)
 
 method reflection*(
@@ -115,6 +115,6 @@ method reflection*(
     model: string,
     lastTurnId: string,
     memTool: tool_base.Tool
-  ): Future[void] {.base, async.} =
+  ): Future[void] {.base, async, gcsafe.} =
   ## Optional post-turn reflection loop. Default: no-op.
   discard

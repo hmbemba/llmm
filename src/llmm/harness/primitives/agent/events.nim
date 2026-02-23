@@ -104,7 +104,7 @@ blok "Event Handling":
     proc onAny*(d: var EventDispatcher, handler: EventHandler) =
         d.globalHandlers.add(handler)
 
-    proc emit*(d: EventDispatcher, event: AgentEvent) =
+    proc emit*(d: EventDispatcher, event: AgentEvent) {.gcsafe.} =
         # Fire kind-specific handlers
         if d.handlers.hasKey(event.kind):
             for h in d.handlers[event.kind]:

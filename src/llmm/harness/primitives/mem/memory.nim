@@ -471,6 +471,10 @@ proc injectMemoryContext*(
 ): string =
     ## Searches memory for top entries and prepends to system prompt.
     ## Returns the augmented system prompt.
+    if store.isNil:
+        icy "injectMemoryContext: store is nil, skipping memory injection"
+        return systemPrompt & "\n\n" & MemorySystemPrompt
+
     if store.count() == 0:
         icb "No memories found, skipping injection"
         return systemPrompt & "\n\n" & MemorySystemPrompt

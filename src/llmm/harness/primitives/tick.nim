@@ -51,12 +51,13 @@ proc chatTurn*(
   input: UserInput,
   useChaining = false,
   maxToolCalls = 0
-): Future[TickResult] {.async.} =
+): Future[TickResult] {.async, gcsafe.} =
 
   # Extract plain text for logging, memory injection, and db storage
   let userText = input.plainText()
 
-  icb "=== chatTurn START ===", a.cfg.model, useChaining, maxToolCalls
+  let maxTC = max(maxToolCalls, a.cfg.policy.maxToolCalls)
+  icb "=== chatTurn START ===", a.cfg.name, a.cfg.model, "maxTC:", maxTC, "chaining:", useChaining
   ic userText
   if input.hasImages: ic "Input contains images"
   if input.hasFiles:  ic "Input contains files"
@@ -88,8 +89,6 @@ proc chatTurn*(
     tools_sent_to_llm.add (if t.isBuiltIn: t.parameters else: %t)
 
   icb "Tools registered " & $tools_sent_to_llm.len
-
-  let maxTC = max(maxToolCalls, a.cfg.policy.maxToolCalls)
 
   var
     res             : TickResult
@@ -197,15 +196,18 @@ proc chatTurn*(
     allResponsesJson : seq[JsonNode]
 
   # ----- Build augmented system prompt (memory injection) -----
-  let augmentedSystemPrompt = if a.cfg.enableReflection:
-    injectMemoryContext(
-      store         = a.state.memoryStore,
-      systemPrompt  = a.cfg.systemPrompt,
-      userMessage   = userText,
-      maxMemories   = 5
-    )
-  else:
-    a.cfg.systemPrompt
+  let augmentedSystemPrompt =
+    if a.cfg.enableReflection and not a.state.memoryStore.isNil:
+      injectMemoryContext(
+        store         = a.state.memoryStore,
+        systemPrompt  = a.cfg.systemPrompt,
+        userMessage   = userText,
+        maxMemories   = 5
+      )
+    else:
+      if a.cfg.enableReflection and a.state.memoryStore.isNil:
+        icy "Memory injection skipped: memoryStore is nil (lightweight agent?)"
+      a.cfg.systemPrompt
 
   icb augmentedSystemPrompt.max_len(200)
 
@@ -291,7 +293,7 @@ proc chatTurn*(
 
         let msg = fmt"Agent attempted to call unknown tool: {tc.name}"
 
-        icr "Unknown tool call", tc.name, toolNames
+        icr "Unknown tool call " & tc.name & " Available tools: " & toolNames
 
         let ev = a.ErrorEvent(
           errorKind         = fkUnknownTool,
@@ -333,9 +335,9 @@ proc chatTurn*(
 
       let callOk = tool_call_was_successful(toolPayload)
       if callOk:
-        ic "Tool result OK", tc.name
+        ic "Tool result OK " & tc.name
       else:
-        icr "Tool result FAILED", tc.name
+        icr "Tool result FAILED " & tc.name
 
       let resultEvent = a.ToolResultEvent(
         tokensUsed        = resp.usage.totalTokens,
@@ -354,15 +356,15 @@ proc chatTurn*(
       # Failure / recovery tracking (OpenAI-only nudges for now)
       if not callOk:
         a.state.failureTracker.recordFailure(tc.name, get_tool_call_error(toolPayload))
-        icy "Failure recorded", tc.name
+        icy "Failure recorded " & tc.name
       elif a.state.failureTracker.checkRecovery(tc.name):
-        ic "Recovery detected for tool", tc.name
+        ic "Recovery detected for tool " & tc.name
         when true:
           if a.provider.kind == prov.pkOpenAIResponses:
             toolOutputs.add(buildToolRecoveryNudge(tc.name))
         a.state.failureTracker.clearRecovery(tc.name)
 
-    icb "Continuing provider turn", toolOutputs.len, "tool outputs"
+    icb "Continuing provider turn " & $toolOutputs.len & " tool outputs"
 
     resp = await a.provider.continueTurn(turnState, toolOutputs)
     enforceTimeout()
@@ -371,7 +373,7 @@ proc chatTurn*(
     allResponsesJson.add resp.responseJson
 
     if not resp.ok:
-      icr "Tool loop provider error", resp.err
+      icr "Tool loop provider error " & resp.err
       finishWithError(fkApiError, resp.err)
 
   # -----------------------------------------------------------------------
@@ -426,7 +428,7 @@ proc chatTurn*(
   )
 
   # Post-turn reflection (never fails the turn)
-  if a.cfg.enableReflection and responseId.len > 0:
+  if a.cfg.enableReflection and responseId.len > 0 and not a.state.memoryStore.isNil:
     icb "Starting post-turn reflection"
     try:
       let memTool = MemoryTool(a.state.memoryStore)
@@ -438,7 +440,7 @@ proc chatTurn*(
     except CatchableError as ex:
       icr "Post-turn reflection failed (non-fatal)", ex.msg
 
-  icb "=== chatTurn DONE ===", res.tokensUsed, res.elapsed
+  icb "=== chatTurn DONE === " & $res.tokensUsed & " tokens used, " & $res.elapsed & " elapsed"
   return res
 
 

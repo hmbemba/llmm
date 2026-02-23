@@ -31,22 +31,22 @@ proc newKimiChatProvider*(client: KimiClient, name = "kimi"): KimiChatProvider =
 # Capabilities / builders
 # -----------------------------------------------------------------------------
 
-method supportsBuiltInTools*(p: KimiChatProvider): bool = true
-method supportsMultimodal*(p: KimiChatProvider): bool = false
+method supportsBuiltInTools*(p: KimiChatProvider): bool {.gcsafe.} = true
+method supportsMultimodal*(p: KimiChatProvider): bool {.gcsafe.} = false
 
-method systemMessage*(p: KimiChatProvider, content: string): JsonNode =
+method systemMessage*(p: KimiChatProvider, content: string): JsonNode {.gcsafe.} =
   kimi_builders.systemMessage(content)
 
-method assistantMessage*(p: KimiChatProvider, content: string): JsonNode =
+method assistantMessage*(p: KimiChatProvider, content: string): JsonNode {.gcsafe.} =
   kimi_builders.assistantMessage(content)
 
-method userMessage*(p: KimiChatProvider, input: UserInput): JsonNode =
+method userMessage*(p: KimiChatProvider, input: UserInput): JsonNode {.gcsafe.} =
   ## Text-only in this harness for now.
   if input.hasImages or input.hasFiles:
     raise newException(ValueError, "Kimi provider currently supports text-only UserInput")
   kimi_builders.userMessage(input.plainText())
 
-method buildToolOutput*(p: KimiChatProvider, call: ToolCall, payload: JsonNode): JsonNode =
+method buildToolOutput*(p: KimiChatProvider, call: ToolCall, payload: JsonNode): JsonNode {.gcsafe.} =
   ## OpenAI-compatible chat completions: role=tool with tool_call_id.
   ## Moonshot's tool-use docs include a required/expected `name` field.
   ##
@@ -251,7 +251,7 @@ method startTurn*(
     tools: seq[JsonNode],
     instructions: string,
     previousTurnId: Option[string]
-  ): Future[tuple[state: TurnState, resp: ProviderResponse]] {.async.} =
+  ): Future[tuple[state: TurnState, resp: ProviderResponse]] {.async, gcsafe.} =
 
   discard previousTurnId # no chaining concept
 
@@ -276,7 +276,7 @@ method continueTurn*(
     p: KimiChatProvider,
     state: TurnState,
     toolOutputs: seq[JsonNode]
-  ): Future[ProviderResponse] {.async.} =
+  ): Future[ProviderResponse] {.async, gcsafe.} =
 
   let st = KimiChatTurnState(state)
 

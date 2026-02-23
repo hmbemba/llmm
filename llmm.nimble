@@ -1,6 +1,6 @@
 # Package
 
-version       = "0.1.1" 
+version       = "0.1.2" 
 author        = "Harrison Mbemba"
 description   = "Context slurper for LLMs - fetch content from local files, repos, and docs"
 license       = "MIT"
@@ -18,6 +18,7 @@ This defines the binary executables you want Nimble to build.
 # Dependencies
 
 requires "nim >= 2.0.0"
+requires "subprocess >= 0.3.2"
 
 # Build Configuration
 
