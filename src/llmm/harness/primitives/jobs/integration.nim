@@ -70,7 +70,7 @@ proc initScheduler*[A](agent: A): AgentScheduler =
     # The cast is safe here because the agent ref is long-lived and pinned.
     let a = agent
     sched.executeAgent = cast[typeof(sched.executeAgent)](
-        proc(prompt: string): Future[tuple[text: string, tokensUsed: int, elapsedMs: int64, error: string]] {.async.} =
+        proc(prompt: string): Future[tuple[text: string, tokensUsed: int, cachedTokens: int, elapsedMs: int64, error: string]] {.async.} =
             icb "Job executing agent.ask", prompt
             try:
                 let startTime = now()
@@ -79,17 +79,18 @@ proc initScheduler*[A](agent: A): AgentScheduler =
                 
                 # Check for error prefix (ask() returns "Error: ..." on failure)
                 if response.startsWith("Error: "):
-                    return (text: "", tokensUsed: 0, elapsedMs: elapsed, error: response)
+                    return (text: "", tokensUsed: 0, cachedTokens: 0, elapsedMs: elapsed, error: response)
                 
                 return (
-                    text       : response
-                    ,tokensUsed: a.state.totalTokensUsed.combined
-                    ,elapsedMs : elapsed
-                    ,error     : ""
+                    text        : response
+                    ,tokensUsed : a.state.totalTokensUsed.combined
+                    ,cachedTokens: a.state.totalTokensUsed.cached
+                    ,elapsedMs  : elapsed
+                    ,error      : ""
                 )
             except CatchableError as ex:
                 icr "Job agent execution failed", ex.msg
-                return (text: "", tokensUsed: 0, elapsedMs: 0'i64, error: ex.msg)
+                return (text: "", tokensUsed: 0, cachedTokens: 0, elapsedMs: 0'i64, error: ex.msg)
     )
 
     # Rehydrate persisted jobs

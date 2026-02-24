@@ -37,6 +37,7 @@ import ./sessions
 import ./store
 import ../tools/base
 import ../../general_helpers
+import ../providers/openai_responses
 import ic
 
 type
@@ -211,9 +212,15 @@ proc createSubagent*(
   maxToolCalls: int = 50,
   inheritTools: bool = true,
   extraTools: seq[Tool] = @[],
-  lightweight: bool = true
+  lightweight: bool = true,
+  personaContent: string = "",
+  staticContext: string = ""
 ): Future[SubagentHandle] {.async, gcsafe.} =
   ## Create a new subagent as a child of the parent agent
+  ##
+  ## Phase 3 Parameters (for optimal prompt caching):
+  ##   personaContent: Static persona/role description (cached across turns)
+  ##   staticContext: Additional static context (knowledge, guidelines, etc.)
   
   # Check if registry exists
   var reg: SubagentRegistry
@@ -278,7 +285,7 @@ Remember: You are autonomous but report to the parent agent. Be concise and acti
   for tool in extraTools:
     subagentTools[tool.name] = tool
   
-  # Create the agent config
+  # Create the agent config - inherit cache settings from parent
   let subagentConfig = AgentConfig(
     id: subagentId,
     name: name,
@@ -290,12 +297,28 @@ Remember: You are autonomous but report to the parent agent. Be concise and acti
     dbPath: subagentWorkspace / &"{name.toSlug()}.db",
     tools: subagentTools,
     policy: AgentPolicy(maxToolCalls: maxToolCalls),
-    enableReflection: (not lightweight)
+    enableReflection: (not lightweight),
+    promptCacheRetention: parent.cfg.promptCacheRetention,  # Inherit retention policy
+    
+    # Phase 3: Static content for optimal caching
+    personaContent: personaContent,
+    staticContext: staticContext
   )
   
-  # Create the agent instance
+  # Create the agent instance with its own provider for cache isolation  # Subagents get strategic cache keys based on their role/name for optimal caching
+  var subagentProvider = parent.provider
+  if parent.provider of OpenAIResponsesProvider:
+    let openaiParentProv = OpenAIResponsesProvider(parent.provider)
+    # Generate strategic cache key: subagent_{role}_{name}_{parent_id}
+    # This groups same-role subagents under the same cache key for efficiency    let cacheKey = &"subagent_{role.toSlug()}_{name.toSlug()}_{parent.cfg.id[0..7]}"
+    let retention = if parent.cfg.promptCacheRetention.len > 0: parent.cfg.promptCacheRetention else: "in_memory"
+    subagentProvider = openaiParentProv.withPromptCacheConfig(
+      cacheKey = cacheKey,
+      retention = retention
+    )
+  
   var subagentAgent = Agent(
-    provider: parent.provider,  # Share the provider
+    provider: subagentProvider,
     cfg: subagentConfig,
     state: AgentState()  # Will be initialized
   )

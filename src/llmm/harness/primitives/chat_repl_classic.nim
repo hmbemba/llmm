@@ -1591,7 +1591,8 @@ proc attachJobHandlers(job: Job, agentName: string, theme: ReplTheme) =
     printMeta(&"Job {jobShortId(e.jobId)} starting (run {e.runNumber})", theme)
 
   job.onCompleted:
-    printMeta(&"Job {jobShortId(e.jobId)} completed ({e.elapsedMs}ms, {e.tokensUsed} tokens).", theme)
+    let cacheInfo = if e.cachedTokens > 0: &", {e.cachedTokens} cached" else: ""
+    printMeta(&"Job {jobShortId(e.jobId)} completed ({e.elapsedMs}ms, {e.tokensUsed} tokens{cacheInfo}).", theme)
     if e.resultText.len > 0:
       let flat = e.resultText.replace("\n", " ").replace("\r", "")
       let preview = if flat.len > 140: flat[0..139] & "…" else: flat

@@ -23,6 +23,7 @@ type
     inputTokens* : int
     outputTokens*: int
     totalTokens* : int
+    cachedTokens*: int  ## How many input tokens were cache hits
 
   ToolCall* = object
     ## Provider-agnostic tool call.
@@ -56,7 +57,8 @@ proc `%`*(u: Usage): JsonNode =
   %*{
     "input_tokens": u.inputTokens,
     "output_tokens": u.outputTokens,
-    "total_tokens": u.totalTokens
+    "total_tokens": u.totalTokens,
+    "cached_tokens": u.cachedTokens
   }
 
 proc `%`*(tc: ToolCall): JsonNode =
@@ -82,6 +84,14 @@ method supportsMultimodal*(p: LlmProvider): bool {.base, gcsafe.} =
 
 method systemMessage*(p: LlmProvider, content: string): JsonNode {.base, gcsafe.} =
   raise newException(ValueError, "systemMessage not implemented for provider: " & p.name)
+
+method developerMessage*(p: LlmProvider, content: string): JsonNode {.base, gcsafe.} =
+  ## Create a developer-role message for static content that should be cached.
+  ## Developer messages are treated specially by OpenAI's cache system and
+  ## are placed after the system message to maximize cacheable prefix.
+  ## Default implementation falls back to system message for providers that
+  ## don't distinguish between system and developer roles.
+  raise newException(ValueError, "developerMessage not implemented for provider: " & p.name)
 
 method assistantMessage*(p: LlmProvider, content: string): JsonNode {.base, gcsafe.} =
   raise newException(ValueError, "assistantMessage not implemented for provider: " & p.name)

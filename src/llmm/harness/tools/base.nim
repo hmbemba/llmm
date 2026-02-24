@@ -177,6 +177,28 @@ proc toolJson*(t: Tool): JsonNode =
     )
 
 
+
+proc getToolDefinitionsJson*(tools: seq[Tool]): JsonNode =
+  ## Returns formatted tool definitions as JSON for the developer message.
+  ## Used to populate cache with tool schema once per agent.
+  ##
+  ## Example output:
+  ##   {
+  ##     "tool_definitions": [
+  ##       {"name": "file_read", "description": "...", "parameters": {...}},
+  ##       ...
+  ##     ],
+  ##     "total_tools": 5
+  ##   }
+  var toolDefs: seq[JsonNode] = @[]
+  for t in tools:
+    toolDefs.add(%t)
+  
+  return %*{
+    "tool_definitions": toolDefs,
+    "total_tools": toolDefs.len
+  }
+
 # -----------------------------------------------------------------------------
 # Tool output helpers
 # -----------------------------------------------------------------------------

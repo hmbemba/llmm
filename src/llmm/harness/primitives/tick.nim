@@ -94,7 +94,7 @@ proc chatTurn*(
     res             : TickResult
     startTime       = now()
     numToolCalls    = 0
-    totalTokensUsed : tuple[input: int, output: int, combined: int]
+    totalTokensUsed : tuple[input: int, output: int, combined: int, cached: int]
 
   # ----- Local helpers -----
 
@@ -173,6 +173,51 @@ proc chatTurn*(
       )
       emitEvent(ev)
 
+  proc estimateTokens(msgs: seq[JsonNode]): int =
+    ## Rough estimation of token count (4 chars ≈ 1 token on average)
+    var totalChars = 0
+    for m in msgs:
+      if m.hasKey("content"):
+        totalChars += m["content"].getStr.len
+    return totalChars div 4
+  
+  proc buildStaticMessages(augmentedSystemPrompt: string): seq[JsonNode] =
+    ## Build static messages that should be cached across turns.
+    ## These are placed first to maximize cacheable prefix.
+    ## Order: system prompt -> persona -> tool definitions -> static context
+    result = @[]
+    
+    # 1. System message (augmented with memory if enabled)
+    if augmentedSystemPrompt.len > 0:
+      result.add a.provider.systemMessage(augmentedSystemPrompt)
+    
+    # 2. Persona content (static role description)
+    if a.cfg.personaContent.len > 0:
+      result.add a.provider.developerMessage("## Persona\n\n" & a.cfg.personaContent)
+    
+    # 3. Tool definitions as developer message (large static content)
+    if a.cfg.tools.len > 0:
+      var toolsList: seq[Tool] = @[]
+      for toolName in a.cfg.tools.keys:
+        let t = a.cfg.tools[toolName]
+        # Skip built-in tools as they're handled separately by the API
+        if not t.isBuiltIn:
+          toolsList.add(t)
+      
+      if toolsList.len > 0:
+        let toolsJson = getToolDefinitionsJson(toolsList)
+        let toolsMsg = "## Available Tools\n\nYou have access to the following tools:\n\n" & $toolsJson
+        result.add a.provider.developerMessage(toolsMsg)
+    
+    # 4. Static context (knowledge, guidelines, etc.)
+    if a.cfg.staticContext.len > 0:
+      result.add a.provider.developerMessage("## Context\n\n" & a.cfg.staticContext)
+    
+    if result.len > 0:
+      icb "=== Cache Structure ==="
+      icb "  Static messages: ", result.len
+      icb "  Static tokens: ~", estimateTokens(result), " (estimated)"
+  
   proc buildInitialMessages(userMsg: JsonNode, augmentedSystemPrompt: string): seq[JsonNode] =
     # Chaining mode: provider decides; we only do the OpenAI-Responses style
     # optimization (send only new user msg + previousTurnId).
@@ -180,14 +225,20 @@ proc chatTurn*(
       icb "Chaining mode: sending only new user msg"
       return @[userMsg]
 
-    icb "Full context mode: system + history + user msg"
+    icb "Full context mode: building cache-optimized prompt structure"
     result = @[]
-    if augmentedSystemPrompt.len > 0:
-      result.add a.provider.systemMessage(augmentedSystemPrompt)
-
+    
+    # Phase 3: Static content first for caching
+    let staticMsgs = buildStaticMessages(augmentedSystemPrompt)
+    for m in staticMsgs:
+      result.add m
+    
+    # Dynamic content after static (conversation history)
+    icb "  History messages: ", a.state.session.messages.len
     for m in a.state.session.messages:
       result.add m
 
+    # Current user message at the end
     result.add userMsg
 
   # Track serialized requests/responses for bulk persist at the end
@@ -268,6 +319,7 @@ proc chatTurn*(
     totalTokensUsed.input    += resp.usage.inputTokens
     totalTokensUsed.output   += resp.usage.outputTokens
     totalTokensUsed.combined += resp.usage.totalTokens
+    totalTokensUsed.cached   += resp.usage.cachedTokens
 
     if resp.toolCalls.len == 0:
       icb "No tool calls — exiting tool loop"
@@ -440,7 +492,14 @@ proc chatTurn*(
     except CatchableError as ex:
       icr "Post-turn reflection failed (non-fatal)", ex.msg
 
+  # Calculate and log cache statistics
+  let cacheHitRate = if totalTokensUsed.combined > 0: 
+    (totalTokensUsed.cached * 100) div totalTokensUsed.combined 
+  else: 0
+  
   icb "=== chatTurn DONE === " & $res.tokensUsed & " tokens used, " & $res.elapsed & " elapsed"
+  #if totalTokensUsed.cached > 0:
+  icb "  Cached tokens: ", totalTokensUsed.cached, " (", cacheHitRate, "% cache hit rate)"
   return res
 
 

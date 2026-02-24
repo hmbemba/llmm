@@ -103,7 +103,7 @@ type
 
   AgentState* = object
     failureTracker* : ToolFailureTracker
-    totalTokensUsed*: tuple[input: int, output: int, combined: int]
+    totalTokensUsed*: tuple[input: int, output: int, combined: int, cached: int]
     events*         : EventDispatcher
     session*        : sessions.ChatSession
     memoryStore*    : MemoryStore
@@ -119,6 +119,11 @@ type
 
     systemPrompt*     : string
     instructions*     : string
+    
+    # Phase 3: Static content for optimal prompt caching
+    personaContent*   : string  ## Static persona/role description (cached across turns)
+    staticContext*    : string  ## Additional static context (knowledge, guidelines, etc.)
+
 
     workspaceDir*     : string
     dbPath*           : string           ## Path to unified SQLite database
@@ -128,6 +133,10 @@ type
     enableReflection* = true # Post-turn memory reflection
 
     knowledgeConfig*  : KnowledgeConfig  ## Chunking/batch settings
+
+    # Prompt Caching Configuration (Phase 2)
+    promptCacheKey*       : string  ## Key for grouping related requests (e.g., "researcher_v1", "main_agent")
+    promptCacheRetention* : string  ## "in_memory" (5-10 min) or "24h" (extended retention)
 
   Agent* = ref object
     ## Provider used by tick/chatTurn.
@@ -155,6 +164,14 @@ proc new*(a: Agent, lightweight: bool = false): Agent =
     #if a.client.isNil:
     #a.provider = newOpenAIResponsesProvider(a.client)
 
+  # Configure prompt caching on OpenAI Responses provider if cache settings are present
+  if a.provider of OpenAIResponsesProvider:
+    if a.cfg.promptCacheKey.len > 0 or a.cfg.promptCacheRetention.len > 0:
+      let openaiProv = OpenAIResponsesProvider(a.provider)
+      openaiProv.setPromptCacheConfig(
+        cacheKey = a.cfg.promptCacheKey,
+        retention = a.cfg.promptCacheRetention
+      )
 
   # Assign defaults for workspace directory if not provided
   if a.cfg.workspaceDir.len == 0:

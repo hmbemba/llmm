@@ -23,9 +23,52 @@ type
 
   OpenAIResponsesProvider* = ref object of LlmProvider
     client*: OpenAIClient
+    promptCacheKey*: Option[string]       ## Cache key for prompt caching
+    promptCacheRetention*: Option[string] ## "in_memory" or "24h"
 
 proc newOpenAIResponsesProvider*(client: OpenAIClient, name = "openai"): OpenAIResponsesProvider =
   OpenAIResponsesProvider(kind: pkOpenAIResponses, name: name, client: client)
+
+proc setPromptCacheConfig*(
+  p: OpenAIResponsesProvider,
+  cacheKey: string = "",
+  retention: string = ""
+) =
+  ## Configure prompt caching for this provider.
+  ##
+  ## Parameters:
+  ##   cacheKey: Key for grouping related requests (e.g., "researcher_v1")
+  ##             Requests with the same key share cached prefixes.
+  ##   retention: "in_memory" (5-10 min, default) or "24h" (extended)
+  ##
+  ## Example:
+  ##   provider.setPromptCacheConfig("researcher_v1", "24h")
+  if cacheKey.len > 0:
+    p.promptCacheKey = some(cacheKey)
+  if retention.len > 0:
+    p.promptCacheRetention = some(retention)
+
+proc withPromptCacheConfig*(
+  p: OpenAIResponsesProvider,
+  cacheKey: string = "",
+  retention: string = ""
+): OpenAIResponsesProvider =
+  ## Create a new provider that shares the same client but with different cache config.
+  ## This is useful for subagents that need their own cache keys.
+  ##
+  ## Parameters:
+  ##   cacheKey: Key for grouping related requests (e.g., "subagent_researcher_v1")
+  ##   retention: "in_memory" (5-10 min, default) or "24h" (extended)
+  ##
+  ## Example:
+  ##   let subagentProvider = parentProvider.withPromptCacheConfig("researcher_v1", "24h")
+  result = OpenAIResponsesProvider(
+    kind: pkOpenAIResponses,
+    name: p.name,
+    client: p.client,
+    promptCacheKey: if cacheKey.len > 0: some(cacheKey) else: p.promptCacheKey,
+    promptCacheRetention: if retention.len > 0: some(retention) else: p.promptCacheRetention
+  )
 
 # -----------------------------------------------------------------------------
 # Builders
@@ -36,6 +79,16 @@ method supportsMultimodal*(p: OpenAIResponsesProvider): bool {.gcsafe.} = true
 
 method systemMessage*(p: OpenAIResponsesProvider, content: string): JsonNode {.gcsafe.} =
   oai_builders.systemMessage(content)
+
+method developerMessage*(p: OpenAIResponsesProvider, content: string): JsonNode {.gcsafe.} =
+  ## Create a developer-role message for static content that should be cached.
+  ## Developer messages are placed after the system message to create a cacheable
+  ## prefix containing tool definitions, persona, and other static context.
+  ## This maximizes cache hit rates in multi-turn conversations.
+  %*{
+    "role": "developer",
+    "content": content
+  }
 
 method assistantMessage*(p: OpenAIResponsesProvider, content: string): JsonNode {.gcsafe.} =
   oai_builders.assistantMessage(content)
@@ -65,7 +118,15 @@ proc toProviderToolCalls(resp: OpenAIResponse): seq[ToolCall] =
 proc toProviderUsage(resp: Rz[OpenAIResponse]): base.Usage =
   if resp.ok and resp.val.usage.isSome:
     let u = resp.val.usage.get
-    return base.Usage(inputTokens: u.inputTokens, outputTokens: u.outputTokens, totalTokens: u.totalTokens)
+    var cached = 0
+    if u.inputTokensDetails.isSome:
+      cached = u.inputTokensDetails.get.cachedTokens
+    return base.Usage(
+      inputTokens: u.inputTokens,
+      outputTokens: u.outputTokens,
+      totalTokens: u.totalTokens,
+      cachedTokens: cached
+    )
   base.Usage()
 
 proc toProviderResponse(resp: Rz[OpenAIResponse], requestJson: JsonNode): ProviderResponse =
@@ -103,6 +164,12 @@ method startTurn*(
 
   if previousTurnId.isSome:
     opts.previousResponseId = previousTurnId
+
+  # Apply prompt caching configuration if set
+  if p.promptCacheKey.isSome:
+    opts.promptCacheKey = p.promptCacheKey
+  if p.promptCacheRetention.isSome:
+    opts.promptCacheRetention = p.promptCacheRetention
 
   opts.input = some %messages
 

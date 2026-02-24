@@ -37,6 +37,12 @@ method supportsMultimodal*(p: KimiChatProvider): bool {.gcsafe.} = false
 method systemMessage*(p: KimiChatProvider, content: string): JsonNode {.gcsafe.} =
   kimi_builders.systemMessage(content)
 
+method developerMessage*(p: KimiChatProvider, content: string): JsonNode {.gcsafe.} =
+  ## Kimi doesn't distinguish between system and developer roles,
+  ## so we map developer messages to system messages for compatibility.
+  ## The static content will still be placed at the beginning for consistency.
+  kimi_builders.systemMessage(content)
+
 method assistantMessage*(p: KimiChatProvider, content: string): JsonNode {.gcsafe.} =
   kimi_builders.assistantMessage(content)
 
@@ -202,7 +208,8 @@ proc toProviderUsage(rzResp: Rz[ChatCompletion]): base.Usage =
     return base.Usage(
       inputTokens: u.promptTokens,
       outputTokens: u.completionTokens,
-      totalTokens: u.totalTokens
+      totalTokens: u.totalTokens,
+      cachedTokens: 0  # Kimi does not support prompt caching
     )
   base.Usage()
 

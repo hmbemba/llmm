@@ -59,6 +59,7 @@ type
             resultText    * : string
             elapsedMs     * : int64
             tokensUsed    * : int
+            cachedTokens  * : int
         of jekFailed:
             errorMessage * : string
         of jekCancelled, jekPaused, jekResumed:
@@ -194,6 +195,7 @@ proc `%`*(e: JobEvent): JsonNode =
         result["resultText"] = %e.resultText
         result["elapsedMs"]  = %e.elapsedMs
         result["tokensUsed"] = %e.tokensUsed
+        result["cachedTokens"] = %e.cachedTokens
     of jekFailed:
         result["errorMessage"] = %e.errorMessage
     else: discard

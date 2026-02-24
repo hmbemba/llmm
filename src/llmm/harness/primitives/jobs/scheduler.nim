@@ -68,7 +68,7 @@ type
 
         ## Callback that executes the agent — set by the integration layer
         ## Signature: proc(taskPrompt: string): Future[tuple[text: string, tokensUsed: int, elapsedMs: int64, error: string]]
-        executeAgent * : proc(prompt: string): Future[tuple[text: string, tokensUsed: int, elapsedMs: int64, error: string]] {.async, gcsafe.}
+        executeAgent * : proc(prompt: string): Future[tuple[text: string, tokensUsed: int, cachedTokens: int, elapsedMs: int64, error: string]] {.async, gcsafe.}
 
 # ============================================================================
 # Job event DSL templates
@@ -169,12 +169,13 @@ proc executeJob(sched: AgentScheduler, job: Job) {.async.} =
             let elapsed = (now() - startTime).inMilliseconds
 
             let completeEvent = JobEvent(
-                timestamp  : now()
-                ,jobId     : job.uid
-                ,kind      : jekCompleted
-                ,resultText: result.text
-                ,elapsedMs : elapsed
-                ,tokensUsed: result.tokensUsed
+                timestamp   : now()
+                ,jobId      : job.uid
+                ,kind       : jekCompleted
+                ,resultText : result.text
+                ,elapsedMs  : elapsed
+                ,tokensUsed : result.tokensUsed
+                ,cachedTokens: result.cachedTokens
             )
             job.events.emit(completeEvent)
 
