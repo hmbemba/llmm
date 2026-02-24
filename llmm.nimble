@@ -1,6 +1,6 @@
 # Package
 
-version       = "0.1.3" 
+version       = "0.1.4" 
 author        = "Harrison Mbemba"
 description   = "Context slurper for LLMs - fetch content from local files, repos, and docs"
 license       = "MIT"
