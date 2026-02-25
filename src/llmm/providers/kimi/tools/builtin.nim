@@ -44,7 +44,7 @@ proc kkRunFormulaFiber(
   ## - OR context.encrypted_output (notably for web-search)
   ##
   ## We return:
-  ## - JString for outputs (so provider can send raw content)
+  ## - JString for successful outputs (so provider passes raw content to model)
   ## - JObject toolError(...) for failures
 
   let body = %*{
@@ -89,6 +89,7 @@ proc kkRunFormulaFiber(
   if ctx.hasKey("output"):
     let outp = ctx["output"]
     if outp.kind == JString:
+      # Return output as raw JString for direct pass-through
       return %outp.getStr
     else:
       # If the tool returns structured JSON, stringify it.
@@ -97,6 +98,8 @@ proc kkRunFormulaFiber(
   if ctx.hasKey("encrypted_output"):
     let outp = ctx["encrypted_output"]
     if outp.kind == JString:
+      # Return encrypted content as raw JString so provider passes it through.
+      # The model expects the raw encrypted format to process it.
       return %outp.getStr
     else:
       return %($outp)

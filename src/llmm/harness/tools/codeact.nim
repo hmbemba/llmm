@@ -126,13 +126,13 @@ type
     dispatch: CodeActDispatch
     allowedTools: seq[string]  # Tools that Python code is allowed to call
 
-proc writeBridgeFile*(workspaceDir: string): string =
-  ## Writes the Python bridge script to the workspace directory
-  ## Returns the path to the bridge file
-  result = workspaceDir / "codeact_bridge.py"
+proc getBridgeFilePath(): string =
+  ## Returns the path to the bridge file in system temp directory
+  ## Writes the bridge file if it doesn't exist
+  let tempDir = getTempDir() / "llmm_codeact"
+  createDir(tempDir)
+  result = tempDir / "codeact_bridge.py"
   if not fileExists(result):
-    # Ensure directory exists
-    createDir(workspaceDir)
     writeFile(result, CodeActBridgePy)
 
 proc isRunning(rt: CodeActRuntime): bool =
@@ -401,7 +401,7 @@ proc newCodeActRuntime*(
   ## Create a new CodeAct runtime with per-agent Python process
   ## 
   ## Parameters:
-  ##   workspaceDir: Directory where bridge file will be written
+  ##   workspaceDir: Directory where bridge file will be written (deprecated, kept for API compatibility)
   ##   dispatch: Callback to execute tool calls from Python
   ##   availableTools: List of tool names that can be called from Python
   ##   pythonExe: Path to Python executable (auto-detected if empty - uses 'python' on Windows, 'python3' on Unix)
@@ -415,8 +415,8 @@ proc newCodeActRuntime*(
     else:
       "python3"
   
-  # Write bridge file if needed
-  let bridgePath = writeBridgeFile(workspaceDir)
+  # Bridge file is now stored in temp directory, not workspace
+  let bridgePath = getBridgeFilePath()
   
   # Build allowlist - exclude codeact_tool itself to prevent recursion
   var allowed: seq[string] = @[]

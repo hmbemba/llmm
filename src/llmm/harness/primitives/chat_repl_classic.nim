@@ -14,7 +14,7 @@
 #   /help, /paste, /clip, /sh, /!, /history, /dbhistory, /save,
 #   /clear, /debug, /stats, /timestamps, /wrap, /width, /cfg,
 #   /session (new, list, switch, rename, delete, info),
-#   /tools (list, add, remove, reload, create, install)
+#   /tools (list, enable, disable, toggle) - runtime tool management
 #
 # Compile flags:
 #   -d:llmm_repl_termui     Enable termui spinner (requires --threads:on)
@@ -44,9 +44,6 @@ import ./jobs/scheduler
 import ./jobs/types as jobtypes
 import ./jobs/store as jobstore
 import ./jobs/schedule_tool
-
-# Dynamic tool loading
-import ./dynamic_tools
 
 # Agent store for database operations
 import ./store
@@ -111,7 +108,6 @@ type
     history*      : seq[ReplMessage]
     running*      : bool
     lastExitCode* : int    ## Exit code from the last /sh or /! command
-    dynamicTools* : DynamicToolRegistry  ## Dynamic tool management
     kvStore*      : Table[string, string]  ## Key-value storage for /kv command
 
 # =============================================================================
@@ -158,7 +154,6 @@ proc initReplState*(): ReplState =
     ,history : @[]
     ,running : true
     ,lastExitCode : 0
-    ,dynamicTools : nil  # Initialized in chatRepl
     ,kvStore : initTable[string, string]()
   )
 
@@ -358,15 +353,12 @@ proc printHelp*(theme: ReplTheme, width: int) =
   echo ""
 
   let toolCmds = @[
-    ("/tools list",           "List all registered tools"),
-    ("/tools list --source",  "Show source file for each tool"),
-    ("/tools add <file.nim>", "Load tools from Nim source file"),
-    ("/tools remove <name>",  "Unload a specific tool"),
-    ("/tools reload <name>",  "Reload a tool from source"),
-    ("/tools reload --all",   "Reload all dynamic tools"),
-    ("/tools create <name>",  "Generate skeleton tool file"),
+    ("/tools",                "List all registered tools with status"),
+    ("/tools list",           "List all registered tools with status"),
+    ("/tools enable <name>",  "Enable one or more tools"),
+    ("/tools disable <name>", "Disable one or more tools (confirms if built-in)"),
+    ("/tools toggle <name>",  "Toggle enable/disable for one or more tools"),
   ]
-
   for (cmd, desc) in toolCmds:
     let padded = cmd & " ".repeat(max(1, 28 - cmd.len))
     echo $styled("    ").fg(theme.metaText) &
@@ -1087,16 +1079,13 @@ proc processSessionCommand*(cmd: string, a: Agent, state: var ReplState, theme: 
     return true
 
 # =============================================================================
-# Dynamic Tool Commands
+# =============================================================================
+# Tool Management Commands (Runtime Enable/Disable)
 # =============================================================================
 
-proc printToolsList*(state: ReplState, theme: ReplTheme, width: int, showSource: bool = false) =
-  ## Display list of all loaded tools.
-  if state.dynamicTools.isNil:
-    printError("Dynamic tools registry not initialized.", theme)
-    return
-  
-  let tools = state.dynamicTools.listLoaded()
+proc printToolsList*(a: Agent, theme: ReplTheme, width: int) =
+  ## Display list of all registered tools with their enabled/disabled status.
+  let tools = a.cfg.tools
   
   if tools.len == 0:
     printMeta("No tools registered.", theme)
@@ -1106,138 +1095,138 @@ proc printToolsList*(state: ReplState, theme: ReplTheme, width: int, showSource:
   echo $styled("  Registered Tools").fg(theme.headerAccent).style(bold, underline)
   thinDivider(width, theme.dividerColor)
   
-  for info in tools:
-    let kindStr = case info.kind
-      of tskNimSource: "nim"
-      of tskCompiledExe: "exe"
-      of tskJsonWrapper: "json"
-    
-    let builtInTag = if info.isBuiltIn: $styled(" [built-in]").fg(theme.toolLabel).style(dim) else: ""
-    let kindTag = $styled(&" ({kindStr})").fg(theme.statText).style(dim)
+  # Sort tool names for consistent display
+  var toolNames: seq[string] = @[]
+  for name in tools.keys:
+    toolNames.add(name)
+  toolNames.sort()
+  
+  for name in toolNames:
+    let tool = tools[name]
+    let statusStr = if tool.isEnabled: "[enabled]" else: "[disabled]"
+    let statusColor = if tool.isEnabled: theme.assistantLabel else: theme.errorLabel
+    let builtInTag = if tool.isBuiltIn: $styled(" [built-in]").fg(theme.toolLabel).style(dim) else: ""
     
     echo $styled("    • ").fg(theme.metaText) &
-         $styled(info.name).fg(theme.userText).style(bold) &
-         kindTag & builtInTag
-    
-    if showSource:
-      let sourceStr = if info.source.len > 0: info.source else: "(unknown)"
-      echo $styled(&"      source: {sourceStr}").fg(theme.metaText).style(dim)
+         $styled(name).fg(theme.userText).style(bold) &
+         " " &
+         $styled(statusStr).fg(statusColor).style(dim) &
+         builtInTag
   
+  let enabledCount = toolNames.filterIt(tools[it].isEnabled).len
   thinDivider(width, theme.dividerColor)
-  printMeta(&"Total: {tools.len} tools", theme)
+  printMeta("Total: " & $tools.len & " tools (" & $enabledCount & " enabled, " & $(tools.len - enabledCount) & " disabled)", theme)
   echo ""
+
+proc setToolEnabled*(a: Agent, toolNames: seq[string], enabled: bool, theme: ReplTheme) =
+  ## Enable or disable one or more tools.
+  var changed: seq[string] = @[]
+  var notFound: seq[string] = @[]
+  var alreadySet: seq[string] = @[]
+  
+  for name in toolNames:
+    if not a.cfg.tools.hasKey(name):
+      notFound.add(name)
+    elif a.cfg.tools[name].isEnabled == enabled:
+      alreadySet.add(name)
+    else:
+      a.cfg.tools[name].isEnabled = enabled
+      changed.add(name)
+  
+  # Report results
+  let action = if enabled: "enabled" else: "disabled"
+  
+  if changed.len > 0:
+    printMeta($changed.len & " tool(s) " & action & ": " & changed.join(", "), theme)
+  
+  if alreadySet.len > 0:
+    printMeta($alreadySet.len & " tool(s) already " & action & ": " & alreadySet.join(", "), theme)
+  
+  if notFound.len > 0:
+    printError("Tool(s) not found: " & notFound.join(", "), theme)
+
+proc confirmToolToggle*(a: Agent, toolNames: seq[string], enable: bool, theme: ReplTheme): bool =
+  ## Ask user for confirmation before enabling/disabling tools.
+  let action = if enable: "enable" else: "disable"
+  
+  echo $styled(&"  Are you sure you want to {action} these {toolNames.len} tool(s)? (y/N) ").fg(theme.errorLabel).style(bold) &
+       $styled(toolNames.join(", ")).fg(theme.userText)
+  stdout.flushFile()
+  
+  let confirm = stdin.readLine().strip().toLowerAscii()
+  return confirm in ["y", "yes"]
 
 proc processToolsCommand*(cmd: string, state: var ReplState, a: Agent, theme: ReplTheme, width: int): bool =
   ## Process /tools subcommands. Returns true if handled.
   let parts = cmd.splitWhitespace()
-  let subCmd = if parts.len > 1: parts[1].strip().toLowerAscii() else: ""
   
-  # Handle flags like /tools list --source
-  var showSource = false
-  var actualSubCmd = subCmd
-  for i in 2 ..< parts.len:
-    if parts[i] == "--source":
-      showSource = true
-    elif actualSubCmd.len == 0:
-      actualSubCmd = parts[i]
-  
-  case actualSubCmd
-  of "", "list", "ls":
-    printToolsList(state, theme, width, showSource)
+  if parts.len == 1:
+    # Just /tools - show list
+    printToolsList(a, theme, width)
     return true
   
-  of "add", "load":
+  let subCmd = parts[1].strip().toLowerAscii()
+  
+  case subCmd
+  of "list", "ls":
+    printToolsList(a, theme, width)
+    return true
+  
+  of "enable":
     if parts.len < 3:
-      printError("Usage: /tools add <filepath.nim>", theme)
+      printError("Usage: /tools enable <tool1> [tool2] ...", theme)
       return true
     
-    let filepath = parts[2]
-    if not fileExists(filepath):
-      # Try relative to tools directory
-      let altPath = state.dynamicTools.toolsDir / filepath
-      if fileExists(altPath):
-        try:
-          let loaded = state.dynamicTools.loadFromNimSource(altPath)
-          printMeta(&"Loaded {loaded.len} tool(s) from {altPath}:", theme)
-          for name in loaded:
-            echo $styled(&"    + {name}").fg(theme.assistantLabel)
-        except CatchableError as ex:
-          printError(&"Failed to load {altPath}: {ex.msg}", theme)
+    let toolNames = parts[2..^1]
+    setToolEnabled(a, toolNames, true, theme)
+    return true
+  
+  of "disable":
+    if parts.len < 3:
+      printError("Usage: /tools disable <tool1> [tool2] ...", theme)
+      return true
+    
+    let toolNames = parts[2..^1]
+    # Confirm if disabling multiple tools or built-in tools
+    var needsConfirm = false
+    for name in toolNames:
+      if a.cfg.tools.hasKey(name) and a.cfg.tools[name].isBuiltIn:
+        needsConfirm = true
+        break
+    
+    if toolNames.len > 1 or needsConfirm:
+      if not confirmToolToggle(a, toolNames, false, theme):
+        printMeta("Operation cancelled.", theme)
+        return true
+    
+    setToolEnabled(a, toolNames, false, theme)
+    return true
+  
+  of "toggle":
+    if parts.len < 3:
+      printError("Usage: /tools toggle <tool1> [tool2] ...", theme)
+      return true
+    
+    let toolNames = parts[2..^1]
+    var toggled: seq[string] = @[]
+    var notFound: seq[string] = @[]
+    
+    for name in toolNames:
+      if not a.cfg.tools.hasKey(name):
+        notFound.add(name)
       else:
-        printError(&"File not found: {filepath}", theme)
-    else:
-      try:
-        let loaded = state.dynamicTools.loadFromNimSource(filepath)
-        printMeta(&"Loaded {loaded.len} tool(s) from {filepath}:", theme)
-        for name in loaded:
-          echo $styled(&"    + {name}").fg(theme.assistantLabel)
-      except CatchableError as ex:
-        printError(&"Failed to load {filepath}: {ex.msg}", theme)
-    return true
-  
-  of "remove", "rm", "del", "unload":
-    if parts.len < 3:
-      printError("Usage: /tools remove <toolName>", theme)
-      return true
+        let newState = not a.cfg.tools[name].isEnabled
+        a.cfg.tools[name].isEnabled = newState
+        toggled.add(name & "->" & (if newState: "enabled" else: "disabled"))
     
-    let toolName = parts[2]
-    try:
-      if state.dynamicTools.unloadTool(toolName):
-        printMeta(&"Removed tool: {toolName}", theme)
-      else:
-        printError(&"Tool not found: {toolName}", theme)
-    except CatchableError as ex:
-      printError(ex.msg, theme)
-    return true
-  
-  of "reload":
-    if parts.len < 3:
-      printError("Usage: /tools reload <toolName>  or  /tools reload --all", theme)
-      return true
-    
-    let arg = parts[2]
-    if arg == "--all":
-      let (success, failed) = state.dynamicTools.reloadAll()
-      printMeta(&"Reloaded {success} tools, {failed} failed", theme)
-    else:
-      try:
-        if state.dynamicTools.reloadTool(arg):
-          printMeta(&"Reloaded tool: {arg}", theme)
-        else:
-          printError(&"Failed to reload: {arg}", theme)
-      except CatchableError as ex:
-        printError(ex.msg, theme)
-    return true
-  
-  of "create", "new", "init":
-    if parts.len < 3:
-      printError("Usage: /tools create <toolName>", theme)
-      return true
-    
-    let toolName = parts[2]
-    try:
-      let path = state.dynamicTools.createToolSkeleton(toolName)
-      printMeta(&"Created tool skeleton: {path}", theme)
-      echo $styled("    Edit the file and run: /tools add " & path.splitFile.name & ".nim").fg(theme.metaText)
-    except CatchableError as ex:
-      printError(ex.msg, theme)
-    return true
-  
-  of "scan", "discover":
-    let files = state.dynamicTools.scanToolDirectory()
-    if files.len == 0:
-      printMeta("No tool files found in tools directory.", theme)
-    else:
-      printMeta(&"Found {files.len} tool file(s):", theme)
-      for f in files:
-        let filename = f.extractFilename
-        let alreadyLoaded = state.dynamicTools.isLoaded(filename.splitFile.name)
-        let status = if alreadyLoaded: $styled(" [loaded]").fg(theme.assistantLabel) else: ""
-        echo $styled(&"    • {filename}{status}").fg(theme.metaText)
+    if toggled.len > 0:
+      printMeta("Toggled: " & toggled.join(", "), theme)
+    if notFound.len > 0:
+      printError("Not found: " & notFound.join(", "), theme)
     return true
   
   else:
-    printError(&"Unknown /tools command: '{actualSubCmd}'. Try: list, add, remove, reload, create, scan", theme)
+    printError(&"Unknown /tools command: '{subCmd}'. Try: list, enable, disable, toggle", theme)
     return true
 
 # =============================================================================
@@ -1713,16 +1702,37 @@ proc showPrompt*(theme: ReplTheme, lastExitCode: int = 0) =
 # =============================================================================
 
 proc replWaitForTurn*(a: Agent, fut: Future[TickResult], theme: ReplTheme): TickResult =
+  ## Wait for a chat turn to complete, with visual feedback and error handling.
+  ## Catches exceptions from the async operation and converts them to error results.
+  
   when defined(llmm_repl_termui):
     let spinner = termuiSpinner(&"{a.cfg.name} is thinking...")
     while not fut.finished:
       asyncdispatch.poll(50)
+    
+    # Check if the future failed with an exception
+    if fut.failed:
+      let ex = fut.readError()
+      spinner.fail(ex.msg)
+      # Return an error result
+      return TickResult(
+        events: @[],
+        text: "",
+        toolCalls: @[],
+        toolResults: @[],
+        tokensUsed: 0,
+        elapsed: initDuration(seconds = 0),
+        done: false,
+        error: some(&"Connection error: {ex.msg}")
+      )
+    
     let res = fut.read()
     if res.error.isSome:
       spinner.fail(res.error.get())
     else:
       spinner.complete("Done")
     return res
+  
   else:
     stdout.write $styled(&"{a.cfg.name} is thinking").fg(theme.metaText).style(dim)
     stdout.flushFile()
@@ -1737,6 +1747,22 @@ proc replWaitForTurn*(a: Agent, fut: Future[TickResult], theme: ReplTheme): Tick
     stdout.write "\r"
     stdout.eraseLine()
     stdout.flushFile()
+    
+    # Check if the future failed with an exception
+    if fut.failed:
+      let ex = fut.readError()
+      # Return an error result
+      return TickResult(
+        events: @[],
+        text: "",
+        toolCalls: @[],
+        toolResults: @[],
+        tokensUsed: 0,
+        elapsed: initDuration(seconds = 0),
+        done: false,
+        error: some(&"Connection error: {ex.msg}")
+      )
+    
     return fut.read()
 
 # =============================================================================
@@ -1813,12 +1839,6 @@ proc printCfg*(cfg: AgentConfig, state: ReplState, sessionName: string = "", ses
   kv("tools", if toolNames.len > 0: toolNames.join(", ") else: "(none)")
   kv("toolCount", $toolNames.len)
   
-  # Show dynamic tools info if available
-  if not state.dynamicTools.isNil:
-    let loaded = state.dynamicTools.listLoaded()
-    let dynamicCount = loaded.filterIt(not it.isBuiltIn).len
-    if dynamicCount > 0:
-      kv("dynamicTools", $dynamicCount)
   
   echo ""
 
@@ -1857,8 +1877,6 @@ proc printCfg*(cfg: AgentConfig, state: ReplState, sessionName: string = "", ses
   kv("loadHistory", $state.settings.loadHistory)
   kv("maxHistoryLoad", $state.settings.maxHistoryLoad)
   
-  if not state.dynamicTools.isNil:
-    kv("toolsDir", state.dynamicTools.toolsDir)
 
   thinDivider(width, theme.dividerColor)
   echo ""
@@ -2079,7 +2097,7 @@ proc chatRepl*(a: Agent, firstMsg: string = "", settings: ReplSettings = default
   ## Features:
   ##   - SQLite-backed chat history (loads prior sessions, persists via chatTurn)
   ##   - Session management (/session new, list, switch, rename, delete)
-  ##   - Dynamic tool loading (/tools add, remove, reload, create)
+  ##   - Runtime tool enable/disable (/tools enable, disable, toggle)
   ##   - Styled message display with word wrapping
   ##   - Tool call visibility (toggle with /debug)
   ##   - Token/time stats (toggle with /stats)
@@ -2116,15 +2134,6 @@ proc chatRepl*(a: Agent, firstMsg: string = "", settings: ReplSettings = default
     else:
       a.addTools ScheduleTool(sched, a.cfg.knowledgeConfig.client)
 
-  # Initialize dynamic tool registry
-  state.dynamicTools = initDynamicTools(a, a.cfg.workspaceDir, hotReload = false)
-  
-  # Auto-load tools from workspace/tools/ directory
-  let (loadedCount, loadErrors) = state.dynamicTools.autoLoadTools()
-  if loadedCount > 0:
-    printMeta(&"Auto-loaded {loadedCount} dynamic tool(s)", theme)
-  for err in loadErrors:
-    printError(&"Tool load error: {err}", theme)
 
   # Print header
   printHeader(a.cfg.name, theme, width)

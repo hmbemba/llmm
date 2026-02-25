@@ -468,25 +468,39 @@ proc injectMemoryContext*(
     ,systemPrompt: string
     ,userMessage : string
     ,maxMemories : int = 5
+    ,includeSystemPrompt: bool = true
 ): string =
     ## Searches memory for top entries and prepends to system prompt.
     ## Returns the augmented system prompt.
+    ## 
+    ## If includeSystemPrompt is false, only the memory block (if any memories exist)
+    ## is appended, not the MemorySystemPrompt description. This is useful when
+    ## the memory tool is disabled at runtime.
+    
     if store.isNil:
         icy "injectMemoryContext: store is nil, skipping memory injection"
-        return systemPrompt & "\n\n" & MemorySystemPrompt
+        if includeSystemPrompt:
+            return systemPrompt & "\n\n" & MemorySystemPrompt
+        return systemPrompt
 
     if store.count() == 0:
         icb "No memories found, skipping injection"
-        return systemPrompt & "\n\n" & MemorySystemPrompt
+        if includeSystemPrompt:
+            return systemPrompt & "\n\n" & MemorySystemPrompt
+        return systemPrompt
 
     let
         memories    = store.topKMemories(maxMemories)
         memoryBlock = formatMemoriesForContext(memories)
 
     if memoryBlock.len > 0:
-        return systemPrompt & "\n\n" & MemorySystemPrompt & "\n" & memoryBlock
+        if includeSystemPrompt:
+            return systemPrompt & "\n\n" & MemorySystemPrompt & "\n" & memoryBlock
+        return systemPrompt & "\n\n" & memoryBlock
 
-    return systemPrompt & "\n\n" & MemorySystemPrompt
+    if includeSystemPrompt:
+        return systemPrompt & "\n\n" & MemorySystemPrompt
+    return systemPrompt
 
 
 proc buildToolFailureNudge*(toolName: string, errorMsg: string): JsonNode =

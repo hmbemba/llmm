@@ -278,28 +278,9 @@ proc enableCodeAct*(a: Agent, pythonExe: string = "") =
   # Add the codeact_tool to the agent
   a.addTools CodeActTool(rt)
   
-  # Append CodeAct guidance to system prompt
-  let codeActPrompt = """
-
----
-CODEACT CAPABILITY: You have access to a Python interpreter via the `codeact_tool`. 
-
-WHEN TO USE CODEACT:
-- Use codeact_tool when you need to perform calculations, data processing, or multi-step operations
-- Use it when you need to chain multiple tool calls together with logic/conditionals
-- Use it for file content analysis, text processing, or complex transformations
-- Prefer codeact_tool over multiple separate tool calls when the operations are related
-
-HOW TO USE CODEACT:
-- Write Python code that can call other tools using: tools("tool_name", arg1=value1, arg2=value2)
-- OR use direct syntax: tool_name(arg1=value1, arg2=value2)
-- Variables and imports persist across codeact_tool calls
-- The Python environment is persistent for this agent session
-- AVOID printing full tool results - print small summaries only to save tokens
-- Return values from tools() are JSON dictionaries you can work with in Python
-
-"""
-  a.cfg.systemPrompt &= codeActPrompt
+  # Note: CodeAct capability is described in the tool definition itself.
+  # We don't append to systemPrompt here - if codeact_tool is disabled at runtime,
+  # the LLM won't see it in the tool definitions.
   
   ic "CodeAct enabled for agent", a.cfg.name
 

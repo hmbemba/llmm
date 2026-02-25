@@ -181,26 +181,6 @@ proc toJson(r: ExecResult): JsonNode =
 # Nim Tools
 # -----------------------------------------------------------------------------
 
-#[
-##@tool
-{
-  "name": "nim_compile",
-  "description": "Compile a Nim source file. Returns compilation output and any errors.",
-  "parameters": {
-    "type": "object",
-    "properties": {
-      "filename": {
-        "type": "string",
-        "description": "Nim source file to compile"
-      }
-    },
-    "required": ["filename"]
-  },
-  "strict": false,
-  "factory": "NimCompileTool"
-}
-##@end
-]#
 proc NimCompileTool*(basePath: string = ".", nimFlags: seq[string] = @[]): Tool =
     ## Compile a Nim file without running it.
     ## Note: strict=false because flags and backend are optional.
@@ -261,26 +241,6 @@ proc NimCompileTool*(basePath: string = ".", nimFlags: seq[string] = @[]): Tool 
     )
 
 
-#[
-##@tool
-{
-  "name": "nim_run",
-  "description": "Compile and run a Nim source file",
-  "parameters": {
-    "type": "object",
-    "properties": {
-      "filename": {
-        "type": "string",
-        "description": "Nim source file to run"
-      }
-    },
-    "required": ["filename"]
-  },
-  "strict": false,
-  "factory": "NimRunTool"
-}
-##@end
-]#
 proc NimRunTool*(basePath: string = ".", nimFlags: seq[string] = @[]): Tool =
     ## Compile and run a Nim file.
     ## Note: strict=false because flags and args are optional.
@@ -346,26 +306,6 @@ proc NimRunTool*(basePath: string = ".", nimFlags: seq[string] = @[]): Tool =
     )
 
 
-#[
-##@tool
-{
-  "name": "nim_check",
-  "description": "Check a Nim source file for syntax errors without compiling.",
-  "parameters": {
-    "type": "object",
-    "properties": {
-      "filename": {
-        "type": "string",
-        "description": "Nim source file to check"
-      }
-    },
-    "required": ["filename"]
-  },
-  "strict": true,
-  "factory": "NimCheckTool"
-}
-##@end
-]#
 proc NimCheckTool*(basePath: string = "."): Tool =
     ## Check Nim file syntax without compiling.
     ## strict=true is fine here - only required parameter.
@@ -404,26 +344,6 @@ proc NimCheckTool*(basePath: string = "."): Tool =
     )
 
 
-#[
-##@tool
-{
-  "name": "nim_test",
-  "description": "Run a Nim test file or discover and run all tests",
-  "parameters": {
-    "type": "object",
-    "properties": {
-      "filename": {
-        "type": "string",
-        "description": "Specific test file to run (optional)"
-      }
-    },
-    "required": []
-  },
-  "strict": false,
-  "factory": "NimTestTool"
-}
-##@end
-]#
 proc NimTestTool*(basePath: string = ".", nimFlags: seq[string] = @[]): Tool =
     ## Run Nim tests (files matching test_*.nim or *_test.nim).
     ## Note: strict=false because all parameters are optional.
@@ -518,26 +438,6 @@ proc NimTestTool*(basePath: string = ".", nimFlags: seq[string] = @[]): Tool =
 # Nim Source Analysis Tools
 # -----------------------------------------------------------------------------
 
-#[
-##@tool
-{
-  "name": "nim_list_types",
-  "description": "List all type definitions in a Nim source file",
-  "parameters": {
-    "type": "object",
-    "properties": {
-      "filename": {
-        "type": "string",
-        "description": "Nim source file to analyze"
-      }
-    },
-    "required": ["filename"]
-  },
-  "strict": true,
-  "factory": "NimListTypesTool"
-}
-##@end
-]#
 proc NimListTypesTool*(basePath: string = "."): Tool =
     ## List type definitions in a Nim source file using native parsing.
     let absBasePath = absolutePath(basePath).normalizedPath
@@ -676,26 +576,6 @@ proc NimListTypesTool*(basePath: string = "."): Tool =
     )
 
 
-#[
-##@tool
-{
-  "name": "nim_list_imports",
-  "description": "List all import and export statements in a Nim source file",
-  "parameters": {
-    "type": "object",
-    "properties": {
-      "filename": {
-        "type": "string",
-        "description": "Nim source file to analyze"
-      }
-    },
-    "required": ["filename"]
-  },
-  "strict": true,
-  "factory": "NimListImportsTool"
-}
-##@end
-]#
 proc NimListImportsTool*(basePath: string = "."): Tool =
     ## List imports and exports in a Nim source file using native parsing.
     let absBasePath = absolutePath(basePath).normalizedPath
@@ -913,26 +793,6 @@ proc NimListImportsTool*(basePath: string = "."): Tool =
                 return toolError(&"Failed to read file: {e.msg}")
     )
 
-#[
-##@tool
-{
-  "name": "nim_list_procs",
-  "description": "List all proc signatures in a Nim source file",
-  "parameters": {
-    "type": "object",
-    "properties": {
-      "filename": {
-        "type": "string",
-        "description": "Nim source file to analyze"
-      }
-    },
-    "required": ["filename"]
-  },
-  "strict": true,
-  "factory": "NimListProcsTool"
-}
-##@end
-]#
 proc NimListProcsTool*(basePath: string = "."): Tool =
     ## List proc signatures in a Nim source file using native parsing.
     let absBasePath = absolutePath(basePath).normalizedPath
@@ -1039,26 +899,6 @@ proc NimListProcsTool*(basePath: string = "."): Tool =
 # Shell/Process Tools
 # -----------------------------------------------------------------------------
 
-#[
-##@tool
-{
-  "name": "shell_exec",
-  "description": "Execute a shell command in the workspace",
-  "parameters": {
-    "type": "object",
-    "properties": {
-      "command": {
-        "type": "string",
-        "description": "Shell command to execute"
-      }
-    },
-    "required": ["command"]
-  },
-  "strict": true,
-  "factory": "ShellExecTool"
-}
-##@end
-]#
 proc ShellExecTool*(basePath: string = ".", allowedCommands: seq[string] = @[]): Tool =
     ## Execute shell commands (optionally restricted).
     ## strict=true - only required parameter.
@@ -1099,26 +939,6 @@ proc ShellExecTool*(basePath: string = ".", allowedCommands: seq[string] = @[]):
     )
 
 
-#[
-##@tool
-{
-  "name": "read_errors",
-  "description": "Parse Nim compilation errors and provide structured analysis",
-  "parameters": {
-    "type": "object",
-    "properties": {
-      "error_output": {
-        "type": "string",
-        "description": "The raw error output from compilation"
-      }
-    },
-    "required": ["error_output"]
-  },
-  "strict": true,
-  "factory": "ReadErrorsTool"
-}
-##@end
-]#
 proc ReadErrorsTool*(basePath: string = "."): Tool =
     ## Parse and summarize compilation errors.
     ## strict=true - only required parameter.

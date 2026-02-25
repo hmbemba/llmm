@@ -38,6 +38,7 @@ type
         strict      * : bool
         handler     * : ToolHandler
         isBuiltIn   * : bool
+        isEnabled   * = true     ## Whether tool is available for LLM use (can be toggled at runtime)
 
     ## A bundle of related tools that often go together.
     ## Example: FileCrudToolkit contains create, read, update, delete, list tools.
@@ -107,17 +108,23 @@ proc `%`*(t: Tool): JsonNode =
 
 proc tool_call_was_successful*(tc_payload: JsonNode): bool =
     ## Check if a tool call tc_payload indicates success.
-    if tc_payload.hasKey("success"):
-        return tc_payload["success"].getBool
-    else:
+    ## String payloads (e.g., Moonshot encrypted content) are treated as successful.
+    if tc_payload == nil:
         return false
+    if tc_payload.kind == JString:
+        return true
+    if tc_payload.kind == JObject and tc_payload.hasKey("success"):
+        return tc_payload["success"].getBool
+    return false
 
 proc get_tool_call_error*(tc_payload: JsonNode): string =
     ## Extract the error message from a tool call tc_payload, if present.
+    ## Returns empty string for string payloads (no error).
+    if tc_payload == nil or tc_payload.kind != JObject:
+        return ""
     if tc_payload.hasKey("error"):
         return tc_payload["error"].getStr
-    else:
-        return ""
+    return ""
 
 proc toolSuccess*(data: JsonNode = nil, message: string = ""): JsonNode =
     ## Create a successful tool result.
@@ -216,3 +223,28 @@ proc functionOutput*(callId: string, payload: JsonNode): JsonNode =
     functionOutput(callId, $payload)
 
 
+
+
+# -----------------------------------------------------------------------------
+# Tool Filtering
+# -----------------------------------------------------------------------------
+
+proc getEnabledTools*(tools: OrderedTable[string, Tool]): seq[Tool] =
+  ## Returns only tools that are enabled (isEnabled = true).
+  ## Used when sending tools to the LLM to respect runtime enable/disable.
+  for name, tool in tools:
+    if tool.isEnabled:
+      result.add(tool)
+
+proc getEnabledToolDefinitions*(tools: OrderedTable[string, Tool]): JsonNode =
+  ## Returns formatted tool definitions for only enabled tools.
+  ## Used when building LLM requests.
+  var toolDefs: seq[JsonNode] = @[]
+  for name, tool in tools:
+    if tool.isEnabled:
+      toolDefs.add(%tool)
+  
+  return %*{
+    "tool_definitions": toolDefs,
+    "total_tools": toolDefs.len
+  }

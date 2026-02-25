@@ -12,7 +12,8 @@ import std/[
   sugar,
   tables,
   sequtils,
-  os
+  os,
+  random
 ]
 
 import rz
@@ -40,6 +41,77 @@ type
     elapsed*    : Duration
     done*       : bool
     error*      : Option[string]
+
+  RetryConfig* = object
+    maxRetries*     : int
+    baseDelayMs*    : int
+    maxDelayMs*     : int
+    retryableErrors*: seq[string]  ## Substrings that indicate retryable errors
+
+const DefaultRetryConfig = RetryConfig(
+  maxRetries: 3,
+  baseDelayMs: 1000,
+  maxDelayMs: 30000,
+  retryableErrors: @[
+    "connection was closed",
+    "connection reset",
+    "timeout",
+    "temporarily unavailable",
+    "rate limit",
+    "too many requests",
+    "server error",
+    "service unavailable",
+    "gateway",
+    "eof"
+  ]
+)
+
+proc isRetryableError(msg: string, cfg: RetryConfig = DefaultRetryConfig): bool =
+  ## Check if an error message indicates a retryable transient failure.
+  let lowerMsg = msg.toLowerAscii()
+  for pattern in cfg.retryableErrors:
+    if pattern in lowerMsg:
+      return true
+  return false
+
+proc calculateBackoff(attempt: int, cfg: RetryConfig = DefaultRetryConfig): int {.gcsafe.} =
+  ## Calculate exponential backoff delay in milliseconds with jitter.
+  ## attempt is 0-indexed (0 = first retry)
+  {.gcsafe.}:
+    randomize()  # Initialize random seed (safe to call multiple times)
+  let base = cfg.baseDelayMs * (1 shl attempt)  # 2^attempt multiplier
+  let jitter = rand(0..500)  # Add up to 500ms random jitter
+  result = min(base + jitter, cfg.maxDelayMs)
+
+proc withRetry*[T](
+  operation: proc(): Future[T] {.async, gcsafe.},
+  operationName: string,
+  cfg: RetryConfig = DefaultRetryConfig
+): Future[tuple[success: bool, result: T, lastError: string]] {.async, gcsafe.} =
+  ## Execute an async operation with exponential backoff retry logic.
+  var lastError = ""
+  
+  for attempt in 0..cfg.maxRetries:
+    try:
+      let res = await operation()
+      return (true, res, "")
+    except CatchableError as e:
+      lastError = e.msg
+      let isRetryable = isRetryableError(lastError, cfg)
+      
+      if attempt < cfg.maxRetries and isRetryable:
+        let delayMs = calculateBackoff(attempt, cfg)
+        icy &"{operationName} failed (attempt {attempt + 1}/{cfg.maxRetries + 1}): {lastError}"
+        icy &"Retrying in {delayMs}ms..."
+        await sleepAsync(delayMs)
+      else:
+        if not isRetryable:
+          icy &"{operationName} failed with non-retryable error: {lastError}"
+        else:
+          icy &"{operationName} failed after {cfg.maxRetries + 1} attempts"
+        break
+  
+  return (false, default(T), lastError)
 
 
 # ---------------------------------------------------------------------------
@@ -80,6 +152,10 @@ proc chatTurn*(
       continue
 
     let t = a.cfg.tools[toolName]
+
+    # Skip disabled tools (runtime toggle via /tools enable/disable)
+    if not t.isEnabled:
+      continue
 
     # Built-in tools (web_search, etc.) are only supported by some providers.
     if t.isBuiltIn and not a.provider.supportsBuiltInTools:
@@ -200,9 +276,10 @@ proc chatTurn*(
       var toolsList: seq[Tool] = @[]
       for toolName in a.cfg.tools.keys:
         let t = a.cfg.tools[toolName]
-        # Skip built-in tools as they're handled separately by the API
-        if not t.isBuiltIn:
-          toolsList.add(t)
+        # Skip disabled tools (runtime toggle) and built-in tools (handled separately by API)
+        if not t.isEnabled or t.isBuiltIn:
+          continue
+        toolsList.add(t)
       
       if toolsList.len > 0:
         let toolsJson = getToolDefinitionsJson(toolsList)
@@ -215,8 +292,8 @@ proc chatTurn*(
     
     if result.len > 0:
       icb "=== Cache Structure ==="
-      icb "  Static messages: ", result.len
-      icb "  Static tokens: ~", estimateTokens(result), " (estimated)"
+      icb "  Static messages: " &  $result.len
+      icb "  Static tokens: ~"  &  $estimateTokens(result) & " (estimated)"
   
   proc buildInitialMessages(userMsg: JsonNode, augmentedSystemPrompt: string): seq[JsonNode] =
     # Chaining mode: provider decides; we only do the OpenAI-Responses style
@@ -247,20 +324,24 @@ proc chatTurn*(
     allResponsesJson : seq[JsonNode]
 
   # ----- Build augmented system prompt (memory injection) -----
+  # Check if memory tool is enabled at runtime (user may have disabled it via /tools disable)
+  let memoryToolEnabled = a.cfg.tools.hasKey("memory") and a.cfg.tools["memory"].isEnabled
+  
   let augmentedSystemPrompt =
     if a.cfg.enableReflection and not a.state.memoryStore.isNil:
       injectMemoryContext(
-        store         = a.state.memoryStore,
-        systemPrompt  = a.cfg.systemPrompt,
-        userMessage   = userText,
-        maxMemories   = 5
+        store              = a.state.memoryStore,
+        systemPrompt       = a.cfg.systemPrompt,
+        userMessage        = userText,
+        maxMemories        = 5,
+        includeSystemPrompt= memoryToolEnabled  # Only include MemorySystemPrompt if tool is enabled
       )
     else:
       if a.cfg.enableReflection and a.state.memoryStore.isNil:
         icy "Memory injection skipped: memoryStore is nil (lightweight agent?)"
       a.cfg.systemPrompt
 
-  icb augmentedSystemPrompt.max_len(200)
+  icb augmentedSystemPrompt #.max_len(200)
 
   # ----- Write user entry to chat history db -----
   db.insertChatEntry(
@@ -286,20 +367,37 @@ proc chatTurn*(
 
   icb "Sending initial provider request"
 
-  var (turnState, resp) = await a.provider.startTurn(
-    model          = a.cfg.model,
-    messages       = msgs,
-    tools          = tools_sent_to_llm,
-    instructions   = a.cfg.instructions,
-    previousTurnId = prevTurnId
+  # Retry wrapper for the initial provider call
+  let startTurnResult = await withRetry(
+    operation = proc(): Future[tuple[state: prov.TurnState, resp: prov.ProviderResponse]] {.async.} =
+      result = await a.provider.startTurn(
+        model          = a.cfg.model,
+        messages       = msgs,
+        tools          = tools_sent_to_llm,
+        instructions   = a.cfg.instructions,
+        previousTurnId = prevTurnId
+      )
+    ,
+    operationName = "startTurn"
   )
   enforceTimeout()
+
+  var turnState: prov.TurnState
+  var resp: prov.ProviderResponse
+  
+  if startTurnResult.success:
+    turnState = startTurnResult.result.state
+    resp = startTurnResult.result.resp
+  else:
+    icr "Initial provider call failed after retries", startTurnResult.lastError
+    discard a.state.session.messages.pop()
+    finishWithError(fkApiError, startTurnResult.lastError)
 
   allReqOptsJson.add resp.requestJson
   allResponsesJson.add resp.responseJson
 
   if not resp.ok:
-    icr "Initial provider call failed", resp.err
+    icr "Initial provider call returned error", resp.err
     discard a.state.session.messages.pop()
     finishWithError(fkApiError, resp.err)
 
@@ -390,6 +488,7 @@ proc chatTurn*(
         ic "Tool result OK " & tc.name
       else:
         icr "Tool result FAILED " & tc.name
+        icr toolPayload
 
       let resultEvent = a.ToolResultEvent(
         tokensUsed        = resp.usage.totalTokens,
@@ -418,8 +517,20 @@ proc chatTurn*(
 
     icb "Continuing provider turn " & $toolOutputs.len & " tool outputs"
 
-    resp = await a.provider.continueTurn(turnState, toolOutputs)
+    # Retry wrapper for continueTurn
+    let continueTurnResult = await withRetry(
+      operation = proc(): Future[prov.ProviderResponse] {.async.} =
+        result = await a.provider.continueTurn(turnState, toolOutputs)
+      ,
+      operationName = "continueTurn"
+    )
     enforceTimeout()
+
+    if continueTurnResult.success:
+      resp = continueTurnResult.result
+    else:
+      icr "Tool loop provider error after retries: " & continueTurnResult.lastError
+      finishWithError(fkApiError, continueTurnResult.lastError)
 
     allReqOptsJson.add resp.requestJson
     allResponsesJson.add resp.responseJson
@@ -499,7 +610,7 @@ proc chatTurn*(
   
   icb "=== chatTurn DONE === " & $res.tokensUsed & " tokens used, " & $res.elapsed & " elapsed"
   #if totalTokensUsed.cached > 0:
-  icb "  Cached tokens: ", totalTokensUsed.cached, " (", cacheHitRate, "% cache hit rate)"
+  icb "  Cached tokens: " & $totalTokensUsed.cached & " (" & $cacheHitRate & "% cache hit rate)"
   return res
 
 
