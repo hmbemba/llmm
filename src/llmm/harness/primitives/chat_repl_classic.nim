@@ -319,6 +319,7 @@ proc printHelp*(theme: ReplTheme, width: int) =
     ("/wrap",              "Toggle word wrapping"),
     ("/width <n>",         "Set max content width (0=auto)"),
     ("/cfg",               "Show current agent + REPL configuration"),
+    ("/model",             "Show or switch LLM model (see /model switch <name>)"),
     ("/session",           "Session management (see below)"),
     ("exit / quit / q",    "End session"),
   ]
@@ -343,6 +344,22 @@ proc printHelp*(theme: ReplTheme, width: int) =
   ]
 
   for (cmd, desc) in sessionCmds:
+    let padded = cmd & " ".repeat(max(1, 28 - cmd.len))
+    echo $styled("    ").fg(theme.metaText) &
+         $styled(padded).fg(cyan).style(bold) &
+         $styled(desc).fg(theme.metaText)
+
+
+  echo ""
+  echo $styled("  Model Commands").fg(theme.headerAccent).style(bold, underline)
+  echo ""
+
+  let modelCmds = @[
+    ("/model",                 "Show current model"),
+    ("/model switch <name>",   "Switch to a different LLM model"),
+  ]
+
+  for (cmd, desc) in modelCmds:
     let padded = cmd & " ".repeat(max(1, 28 - cmd.len))
     echo $styled("    ").fg(theme.metaText) &
          $styled(padded).fg(cyan).style(bold) &
@@ -2076,6 +2093,30 @@ proc processCommand*(cmd: string, state: var ReplState, agentName: string,
   
   of "/kv":
     return processKVCommand(cmd, state, theme, width)
+
+  of "/model":
+    if not agent.isNil:
+      let parts = cmd.splitWhitespace(maxsplit = 2)
+      if parts.len < 2:
+        # Show current model
+        printMeta(&"Current model: {agent.cfg.model}", theme)
+      else:
+        let subCmd = parts[1].toLowerAscii()
+        if subCmd == "switch" and parts.len >= 3:
+          let newModel = parts[2].strip()
+          let oldModel = agent.cfg.model
+          if newModel == oldModel:
+            printMeta(&"Already using model: {newModel}", theme)
+          else:
+            agent.cfg.model = newModel
+            printMeta(&"Switched model: {oldModel} → {newModel}", theme)
+            printMeta("Note: The model will be validated on your next message.", theme)
+        else:
+          printError("Usage: /model (show current) or /model switch <model-name>", theme)
+      return true
+    else:
+      printError("Model switching not available (agent reference missing).", theme)
+      return true
 
   else:
     # Handle /! shorthand — interactive mode (full terminal handover)
